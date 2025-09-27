@@ -11,6 +11,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = REPO_ROOT / "package"
 EXECUTABLE_NAME = "CCTranslationTool.exe"
+ICON_SOURCE = REPO_ROOT / "icon" / "CCT_icon.png"
+ICON_CONVERTED = REPO_ROOT / "icon" / "CCT_icon.ico"
 
 
 def _check_platform() -> None:
@@ -34,6 +36,43 @@ def _ensure_pyinstaller() -> None:
         ) from exc
 
 
+def _prepare_icon() -> Path:
+    """Convert the source PNG into an ICO file for PyInstaller."""
+
+    if not ICON_SOURCE.exists():
+        raise SystemExit(f"Icon asset not found at {ICON_SOURCE!s}.")
+
+    try:
+        from PIL import Image  # type: ignore
+    except ModuleNotFoundError as exc:  # pragma: no cover - dependency check
+        raise SystemExit(
+            "Pillow is required to prepare the application icon. "
+            "Install it with `pip install pillow`."
+        ) from exc
+
+    ICON_CONVERTED.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(ICON_SOURCE) as image:
+        image = image.convert("RGBA")
+        width, height = image.size
+        max_dim = max(width, height)
+        if width != height:
+            square = Image.new("RGBA", (max_dim, max_dim), (0, 0, 0, 0))
+            offset = ((max_dim - width) // 2, (max_dim - height) // 2)
+            square.paste(image, offset)
+            image = square
+
+        available_sizes = [
+            size for size in (256, 128, 64, 48, 32, 24, 16) if size <= image.size[0]
+        ]
+        if not available_sizes:
+            available_sizes = [image.size[0]]
+
+        icon_sizes = [(size, size) for size in available_sizes]
+        image.save(ICON_CONVERTED, format="ICO", sizes=icon_sizes)
+
+    return ICON_CONVERTED
+
+
 def build() -> Path:
     """Create a one-file executable using PyInstaller.
 
@@ -42,6 +81,7 @@ def build() -> Path:
 
     _check_platform()
     _ensure_pyinstaller()
+    icon_path = _prepare_icon()
 
     command = [
         sys.executable,
@@ -53,6 +93,10 @@ def build() -> Path:
         "--onefile",
         "--name",
         EXECUTABLE_NAME.replace(".exe", ""),
+        "--icon",
+        str(icon_path),
+        "--add-data",
+        f"{ICON_SOURCE};icon",
         str(REPO_ROOT / "translator_app.py"),
     ]
 
