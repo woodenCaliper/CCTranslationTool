@@ -121,10 +121,17 @@ class TranslationWindowManager:
         def hide_window() -> None:
             window.withdraw()
 
+        def handle_escape(event: tk.Event) -> str:
+            """Hide the window when the Escape key is pressed."""
+
+            hide_window()
+            return "break"
+
         close_button = tk.Button(window, text="Close", command=hide_window)
         close_button.pack(pady=(0, 10))
 
         window.protocol("WM_DELETE_WINDOW", hide_window)
+        window.bind("<Escape>", handle_escape)
 
         def _monitor_work_area(pointer_x: int, pointer_y: int) -> tuple[int, int, int, int] | None:
             """Return work area bounds for the monitor nearest the pointer."""
