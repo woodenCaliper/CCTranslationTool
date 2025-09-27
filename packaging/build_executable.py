@@ -49,6 +49,7 @@ def build() -> Path:
         "PyInstaller",
         "--clean",
         "--noconfirm",
+        "--noconsole",
         "--onefile",
         "--name",
         EXECUTABLE_NAME.replace(".exe", ""),

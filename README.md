@@ -53,4 +53,4 @@ python -m unittest discover
    python packaging/build_executable.py
    ```
 
-スクリプトは `package` ディレクトリを作成し、その中に `CCTranslationTool.exe` を出力します。PyInstaller が生成する一時的な `build/` や `dist/` ディレクトリ、`.spec` ファイルは自動的に削除されます。
+スクリプトは `package` ディレクトリを作成し、その中に `CCTranslationTool.exe` を出力します。生成される実行ファイルはコンソールウィンドウを表示せずにバックグラウンドで起動します。PyInstaller が生成する一時的な `build/` や `dist/` ディレクトリ、`.spec` ファイルは自動的に削除されます。
