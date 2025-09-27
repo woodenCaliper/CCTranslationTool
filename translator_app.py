@@ -7,6 +7,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable, Optional, Protocol
 
@@ -45,6 +46,13 @@ from translation_service import GoogleTranslateClient, TranslationError, Transla
 
 
 DOUBLE_COPY_INTERVAL = 0.5  # Seconds allowed between two copy events.
+
+
+def _resource_path(relative_path: str) -> Path:
+    """Return an absolute path to a bundled resource."""
+
+    base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))  # type: ignore[attr-defined]
+    return base_path / relative_path
 
 
 @dataclass
@@ -350,7 +358,17 @@ class SystemTrayController:
         icon.stop()
 
     def _create_icon_image(self) -> "Image.Image":
-        assert Image is not None and ImageDraw is not None  # noqa: S101 - guarded by _is_supported
+        assert Image is not None  # noqa: S101 - guarded by _is_supported
+
+        icon_path = _resource_path("icon/CCT_icon.png")
+        if icon_path.exists():
+            try:
+                with Image.open(icon_path) as icon:
+                    return icon.convert("RGBA")
+            except Exception:
+                pass
+
+        assert ImageDraw is not None  # noqa: S101 - fallback icon requires drawing support
         size = 64
         image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
