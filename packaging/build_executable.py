@@ -50,30 +50,25 @@ def _prepare_icon() -> Path:
             "Install it with `pip install pillow`."
         ) from exc
 
-    needs_conversion = not ICON_CONVERTED.exists() or (
-        ICON_CONVERTED.stat().st_mtime < ICON_SOURCE.stat().st_mtime
-    )
+    ICON_CONVERTED.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(ICON_SOURCE) as image:
+        image = image.convert("RGBA")
+        width, height = image.size
+        max_dim = max(width, height)
+        if width != height:
+            square = Image.new("RGBA", (max_dim, max_dim), (0, 0, 0, 0))
+            offset = ((max_dim - width) // 2, (max_dim - height) // 2)
+            square.paste(image, offset)
+            image = square
 
-    if needs_conversion:
-        ICON_CONVERTED.parent.mkdir(parents=True, exist_ok=True)
-        with Image.open(ICON_SOURCE) as image:
-            image = image.convert("RGBA")
-            width, height = image.size
-            max_dim = max(width, height)
-            if width != height:
-                square = Image.new("RGBA", (max_dim, max_dim), (0, 0, 0, 0))
-                offset = ((max_dim - width) // 2, (max_dim - height) // 2)
-                square.paste(image, offset)
-                image = square
+        available_sizes = [
+            size for size in (256, 128, 64, 48, 32, 24, 16) if size <= image.size[0]
+        ]
+        if not available_sizes:
+            available_sizes = [image.size[0]]
 
-            available_sizes = [
-                size for size in (256, 128, 64, 48, 32, 24, 16) if size <= image.size[0]
-            ]
-            if not available_sizes:
-                available_sizes = [image.size[0]]
-
-            icon_sizes = [(size, size) for size in available_sizes]
-            image.save(ICON_CONVERTED, format="ICO", sizes=icon_sizes)
+        icon_sizes = [(size, size) for size in available_sizes]
+        image.save(ICON_CONVERTED, format="ICO", sizes=icon_sizes)
 
     return ICON_CONVERTED
 
