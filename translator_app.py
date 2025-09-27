@@ -6,7 +6,7 @@ import argparse
 import queue
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Callable, Optional, Protocol
 
@@ -44,6 +44,34 @@ class TranslatorProtocol(Protocol):  # pragma: no cover - protocol is for type c
         """Translate text and return a result object."""
 
 
+@dataclass
+class DoubleCopyDetector:
+    """Utility that tracks consecutive copy events within a time window."""
+
+    interval: float
+    now: Callable[[], float]
+    _last_time: float = field(default=0.0, init=False)
+    _count: int = field(default=0, init=False)
+
+    def register(self) -> bool:
+        """Register a copy event.
+
+        Returns ``True`` if the event completes a "double copy" sequence.
+        """
+
+        current = self.now()
+        if current - self._last_time <= self.interval:
+            self._count += 1
+        else:
+            self._count = 1
+        self._last_time = current
+
+        if self._count >= 2:
+            self._count = 0
+            return True
+        return False
+
+
 class CCTranslationApp:
     """Listens for double Ctrl+C and shows the translated text."""
 
@@ -63,8 +91,7 @@ class CCTranslationApp:
         self.source_language = source_language
         self._translator: Optional[TranslatorProtocol] = None
         self._translator_factory = translator_factory
-        self._last_copy_time: float = 0.0
-        self._copy_count: int = 0
+        self._copy_detector = DoubleCopyDetector(double_copy_interval, time_provider)
         self._lock = threading.Lock()
         self._request_queue: "queue.Queue[TranslationRequest]" = queue.Queue()
         if keyboard_module is None:
@@ -77,9 +104,7 @@ class CCTranslationApp:
             )
         self._keyboard = keyboard_module
         self._clipboard = clipboard_module
-        self._time_provider = time_provider
         self._display_callback = display_callback
-        self._double_copy_interval = double_copy_interval
 
     @property
     def translator(self) -> TranslatorProtocol:
@@ -102,16 +127,8 @@ class CCTranslationApp:
             self._keyboard.unhook_all()
 
     def _handle_copy_event(self) -> None:
-        now = self._time_provider()
         with self._lock:
-            if now - self._last_copy_time <= self._double_copy_interval:
-                self._copy_count += 1
-            else:
-                self._copy_count = 1
-            self._last_copy_time = now
-
-            if self._copy_count >= 2:
-                self._copy_count = 0
+            if self._copy_detector.register():
                 text = self._clipboard.paste().strip()
                 if text:
                     self._request_queue.put(
@@ -148,6 +165,13 @@ class CCTranslationApp:
             window = tk.Tk()
             window.title("CCTranslationTool")
             window.geometry("500x400")
+
+            def bring_to_front() -> None:
+                window.lift()
+                window.attributes("-topmost", True)
+                window.focus_force()
+
+            window.after_idle(bring_to_front)
 
             header = tk.Label(
                 window,
