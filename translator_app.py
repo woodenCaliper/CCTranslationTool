@@ -26,6 +26,21 @@ try:
 except ImportError as exc:  # pragma: no cover - tkinter is part of stdlib on Windows
     raise SystemExit("tkinter is required to display the translation window") from exc
 
+try:  # pragma: no cover - optional dependency for system tray support
+    import pystray  # type: ignore
+    from pystray import MenuItem  # type: ignore
+except ImportError:  # pragma: no cover - handled when starting the tray icon
+    pystray = None  # type: ignore
+    MenuItem = None  # type: ignore
+
+try:  # pragma: no cover - optional dependency for system tray support
+    from PIL import Image, ImageDraw  # type: ignore
+except ImportError:  # pragma: no cover - handled when starting the tray icon
+    Image = None  # type: ignore
+    ImageDraw = None  # type: ignore
+
+import sys
+
 from translation_service import GoogleTranslateClient, TranslationError, TranslationResult
 
 
@@ -291,6 +306,59 @@ class TranslationWindowManager:
         window.mainloop()
 
 
+class SystemTrayController:
+    """Manage a Windows system tray icon with an Exit command."""
+
+    def __init__(self, app: "CCTranslationApp") -> None:
+        self._app = app
+        self._icon: Optional["pystray.Icon"] = None
+        self._icon_image: Optional["Image.Image"] = None
+
+    @staticmethod
+    def _is_supported() -> bool:
+        return (
+            sys.platform == "win32"
+            and pystray is not None
+            and MenuItem is not None
+            and Image is not None
+            and ImageDraw is not None
+        )
+
+    def start(self) -> None:
+        if not self._is_supported():
+            if sys.platform == "win32":
+                print(
+                    "System tray icon is unavailable because required dependencies are missing."
+                )
+            return
+
+        assert pystray is not None  # noqa: S101 - guarded by _is_supported
+        image = self._create_icon_image()
+        self._icon_image = image
+        menu = pystray.Menu(MenuItem("Exit", self._on_exit))
+        self._icon = pystray.Icon("cctranslationtool", image, "CCTranslationTool", menu=menu)
+        self._icon.run_detached()
+
+    def stop(self) -> None:
+        if self._icon is not None:
+            self._icon.stop()
+            self._icon = None
+        self._icon_image = None
+
+    def _on_exit(self, icon: "pystray.Icon", _: MenuItem) -> None:
+        self._app.stop()
+        icon.stop()
+
+    def _create_icon_image(self) -> "Image.Image":
+        assert Image is not None and ImageDraw is not None  # noqa: S101 - guarded by _is_supported
+        size = 64
+        image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        draw.ellipse((8, 8, size - 8, size - 8), fill=(28, 114, 206, 255))
+        draw.rectangle((size // 2 - 4, 16, size // 2 + 4, size - 16), fill=(255, 255, 255, 255))
+        return image
+
+
 class CCTranslationApp:
     """Listens for double Ctrl+C and shows the translated text."""
 
@@ -313,6 +381,7 @@ class CCTranslationApp:
         self._copy_detector = DoubleCopyDetector(double_copy_interval, time_provider)
         self._lock = threading.Lock()
         self._request_queue: "queue.Queue[TranslationRequest]" = queue.Queue()
+        self._stop_event = threading.Event()
         if keyboard_module is None:
             raise RuntimeError(
                 "The 'keyboard' package is required. Install it with 'pip install keyboard'."
@@ -325,6 +394,7 @@ class CCTranslationApp:
         self._clipboard = clipboard_module
         self._display_callback = display_callback
         self._window_manager = TranslationWindowManager(self.source_language, self.dest_language)
+        self._tray_controller: Optional[SystemTrayController] = None
 
     @property
     def translator(self) -> TranslatorProtocol:
@@ -332,19 +402,32 @@ class CCTranslationApp:
             self._translator = self._translator_factory()
         return self._translator
 
-    def start(self) -> None:
+    def start(self, *, tray_controller: Optional[SystemTrayController] = None) -> None:
         """Start listening for keyboard events and processing translations."""
 
+        self._tray_controller = tray_controller
         self._keyboard.add_hotkey("ctrl+c", self._handle_copy_event, suppress=False)
 
         worker = threading.Thread(target=self._process_requests, daemon=True)
         worker.start()
 
         print("CCTranslationTool is running. Double press Ctrl+C on selected text to translate.")
+        if self._tray_controller is not None:
+            self._tray_controller.start()
+
         try:
-            self._keyboard.wait()  # Blocks forever until keyboard is interrupted (Ctrl+C in console).
+            self._stop_event.wait()
+        except KeyboardInterrupt:  # pragma: no cover - manual console interruption
+            self.stop()
         finally:
             self._keyboard.unhook_all()
+            if self._tray_controller is not None:
+                self._tray_controller.stop()
+
+    def stop(self) -> None:
+        """Signal the application to shut down."""
+
+        self._stop_event.set()
 
     def _handle_copy_event(self) -> None:
         with self._lock:
@@ -402,7 +485,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     app = CCTranslationApp(dest_language=args.dest, source_language=args.src)
-    app.start()
+    tray_controller = SystemTrayController(app)
+    app.start(tray_controller=tray_controller)
 
 
 if __name__ == "__main__":

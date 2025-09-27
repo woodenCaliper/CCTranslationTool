@@ -126,6 +126,12 @@ class CCTranslationAppTests(unittest.TestCase):
         self.assertIn("Error during translation", captured[0][1])
         self.assertEqual(captured[0][2], "en")
 
+    def test_stop_sets_event(self):
+        app = self._create_app()
+        self.assertFalse(app._stop_event.is_set())
+        app.stop()
+        self.assertTrue(app._stop_event.is_set())
+
 
 if __name__ == "__main__":
     unittest.main()
