@@ -165,9 +165,13 @@ class CCTranslationApp:
             window = tk.Tk()
             window.title("CCTranslationTool")
             window.geometry("500x400")
-            window.lift()
-            window.attributes("-topmost", True)
-            window.focus_force()
+
+            def bring_to_front() -> None:
+                window.lift()
+                window.attributes("-topmost", True)
+                window.focus_force()
+
+            window.after_idle(bring_to_front)
 
             header = tk.Label(
                 window,
