@@ -126,7 +126,20 @@ class TranslationWindowManager:
 
         window.protocol("WM_DELETE_WINDOW", hide_window)
 
+        def place_near_pointer() -> None:
+            window.update_idletasks()
+            width = window.winfo_width() or window.winfo_reqwidth()
+            height = window.winfo_height() or window.winfo_reqheight()
+            pointer_x = window.winfo_pointerx() - width // 2
+            pointer_y = window.winfo_pointery() - height // 2
+            screen_width = window.winfo_screenwidth()
+            screen_height = window.winfo_screenheight()
+            x = min(max(pointer_x, 0), max(screen_width - width, 0))
+            y = min(max(pointer_y, 0), max(screen_height - height, 0))
+            window.geometry(f"+{x}+{y}")
+
         def bring_to_front() -> None:
+            place_near_pointer()
             window.deiconify()
             window.lift()
             window.attributes("-topmost", True)
