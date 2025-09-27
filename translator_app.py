@@ -202,10 +202,63 @@ class TranslationWindowManager:
             y = min(max(target_y, top), max_y)
             window.geometry(f"+{x}+{y}")
 
+        def _force_foreground() -> None:
+            """Ensure the Tk window becomes the active foreground window."""
+
+            import sys
+
+            if sys.platform != "win32":
+                return
+
+            try:  # pragma: no cover - Windows specific implementation
+                import ctypes
+                from ctypes import wintypes
+            except Exception:  # pragma: no cover - if ctypes is unavailable
+                return
+
+            user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+
+            hwnd = wintypes.HWND(window.winfo_id())
+            if not hwnd:
+                return
+
+            SW_SHOWNORMAL = 1
+
+            user32.ShowWindow(hwnd, SW_SHOWNORMAL)
+
+            user32.GetForegroundWindow.restype = wintypes.HWND
+            foreground_hwnd = user32.GetForegroundWindow()
+            if foreground_hwnd == hwnd:
+                return
+
+            user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+            user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+
+            pid = wintypes.DWORD()
+            foreground_thread_id = user32.GetWindowThreadProcessId(
+                foreground_hwnd, ctypes.byref(pid)
+            )
+            current_thread_id = kernel32.GetCurrentThreadId()
+
+            attached = False
+            if foreground_thread_id and foreground_thread_id != current_thread_id:
+                attached = bool(
+                    user32.AttachThreadInput(foreground_thread_id, current_thread_id, True)
+                )
+
+            try:
+                user32.BringWindowToTop(hwnd)
+                user32.SetForegroundWindow(hwnd)
+            finally:
+                if attached:
+                    user32.AttachThreadInput(foreground_thread_id, current_thread_id, False)
+
         def bring_to_front() -> None:
             place_near_pointer()
             window.deiconify()
             window.lift()
+            _force_foreground()
             window.attributes("-topmost", True)
             window.after(100, lambda: window.attributes("-topmost", False))
             window.focus_force()
