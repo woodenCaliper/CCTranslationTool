@@ -72,6 +72,95 @@ class DoubleCopyDetector:
         return False
 
 
+class TranslationWindowManager:
+    """Create and reuse a single Tk window for displaying translations."""
+
+    def __init__(self, source_language: Optional[str], dest_language: str) -> None:
+        self._source_language = source_language
+        self._dest_language = dest_language
+        self._queue: "queue.Queue[tuple[str, str, Optional[str]]]" = queue.Queue()
+        self._ready = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def show(self, original: str, translated: str, detected_source: Optional[str]) -> None:
+        if self._thread is None or not self._thread.is_alive():
+            self._ready.clear()
+            self._thread = threading.Thread(target=self._run_window, daemon=True)
+            self._thread.start()
+            self._ready.wait()
+        self._queue.put((original, translated, detected_source))
+
+    def _run_window(self) -> None:
+        window = tk.Tk()
+        window.title("CCTranslationTool")
+        window.geometry("500x400")
+        window.withdraw()
+
+        header = tk.Label(
+            window,
+            text="",
+            font=("Segoe UI", 12, "bold"),
+            wraplength=480,
+        )
+        header.pack(pady=(10, 5))
+
+        original_label = tk.Label(window, text="Original", font=("Segoe UI", 10, "bold"))
+        original_label.pack(anchor="w", padx=10)
+
+        original_box = scrolledtext.ScrolledText(window, wrap=tk.WORD, height=8)
+        original_box.configure(state=tk.DISABLED)
+        original_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        translated_label = tk.Label(window, text="Translated", font=("Segoe UI", 10, "bold"))
+        translated_label.pack(anchor="w", padx=10)
+
+        translated_box = scrolledtext.ScrolledText(window, wrap=tk.WORD, height=8)
+        translated_box.configure(state=tk.DISABLED)
+        translated_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        def hide_window() -> None:
+            window.withdraw()
+
+        close_button = tk.Button(window, text="Close", command=hide_window)
+        close_button.pack(pady=(0, 10))
+
+        window.protocol("WM_DELETE_WINDOW", hide_window)
+
+        def bring_to_front() -> None:
+            window.deiconify()
+            window.lift()
+            window.attributes("-topmost", True)
+            window.after(100, lambda: window.attributes("-topmost", False))
+            window.focus_force()
+
+        def apply_update() -> None:
+            try:
+                while True:
+                    original, translated, detected_source = self._queue.get_nowait()
+                    header.configure(
+                        text=(
+                            f"Detected source: {detected_source or self._source_language or 'auto'} "
+                            f"→ {self._dest_language}"
+                        )
+                    )
+                    original_box.configure(state=tk.NORMAL)
+                    original_box.delete("1.0", tk.END)
+                    original_box.insert(tk.END, original)
+                    original_box.configure(state=tk.DISABLED)
+                    translated_box.configure(state=tk.NORMAL)
+                    translated_box.delete("1.0", tk.END)
+                    translated_box.insert(tk.END, translated)
+                    translated_box.configure(state=tk.DISABLED)
+                    bring_to_front()
+            except queue.Empty:
+                pass
+            window.after(100, apply_update)
+
+        self._ready.set()
+        apply_update()
+        window.mainloop()
+
+
 class CCTranslationApp:
     """Listens for double Ctrl+C and shows the translated text."""
 
@@ -105,6 +194,7 @@ class CCTranslationApp:
         self._keyboard = keyboard_module
         self._clipboard = clipboard_module
         self._display_callback = display_callback
+        self._window_manager = TranslationWindowManager(self.source_language, self.dest_language)
 
     @property
     def translator(self) -> TranslatorProtocol:
@@ -161,48 +251,7 @@ class CCTranslationApp:
             self._show_translation_window(original, translated, detected_source)
 
     def _show_translation_window(self, original: str, translated: str, detected_source: Optional[str]) -> None:
-        def runner() -> None:
-            window = tk.Tk()
-            window.title("CCTranslationTool")
-            window.geometry("500x400")
-
-            def bring_to_front() -> None:
-                window.lift()
-                window.attributes("-topmost", True)
-                window.focus_force()
-
-            window.after_idle(bring_to_front)
-
-            header = tk.Label(
-                window,
-                text=f"Detected source: {detected_source or self.source_language or 'auto'} → {self.dest_language}",
-                font=("Segoe UI", 12, "bold"),
-                wraplength=480,
-            )
-            header.pack(pady=(10, 5))
-
-            original_label = tk.Label(window, text="Original", font=("Segoe UI", 10, "bold"))
-            original_label.pack(anchor="w", padx=10)
-
-            original_box = scrolledtext.ScrolledText(window, wrap=tk.WORD, height=8)
-            original_box.insert(tk.END, original)
-            original_box.configure(state=tk.DISABLED)
-            original_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
-
-            translated_label = tk.Label(window, text="Translated", font=("Segoe UI", 10, "bold"))
-            translated_label.pack(anchor="w", padx=10)
-
-            translated_box = scrolledtext.ScrolledText(window, wrap=tk.WORD, height=8)
-            translated_box.insert(tk.END, translated)
-            translated_box.configure(state=tk.DISABLED)
-            translated_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
-
-            close_button = tk.Button(window, text="Close", command=window.destroy)
-            close_button.pack(pady=(0, 10))
-
-            window.mainloop()
-
-        threading.Thread(target=runner, daemon=True).start()
+        self._window_manager.show(original, translated, detected_source)
 
 
 def parse_args() -> argparse.Namespace:
