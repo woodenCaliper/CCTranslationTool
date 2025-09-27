@@ -36,3 +36,21 @@ python -m unittest discover
 ```
 
 テストではホットキー検知や翻訳処理をモック化しており、ダブルコピー判定やエラーハンドリングの動作を検証できます。
+
+## Windows 用実行ファイルの作成
+
+`PyInstaller` を利用して 1 つの実行ファイルにまとめるためのスクリプトを `packaging/build_executable.py` に用意しています。Windows 環境で以下の手順を実行してください。
+
+1. 依存関係に加えて `PyInstaller` をインストールします。
+
+   ```bash
+   pip install -r requirements.txt pyinstaller
+   ```
+
+2. パッケージングスクリプトを実行します。
+
+   ```bash
+   python packaging/build_executable.py
+   ```
+
+スクリプトは `package` ディレクトリを作成し、その中に `CCTranslationTool.exe` を出力します。PyInstaller が生成する一時的な `build/` や `dist/` ディレクトリ、`.spec` ファイルは自動的に削除されます。
