@@ -126,16 +126,73 @@ class TranslationWindowManager:
 
         window.protocol("WM_DELETE_WINDOW", hide_window)
 
+        def _monitor_work_area(pointer_x: int, pointer_y: int) -> tuple[int, int, int, int] | None:
+            """Return work area bounds for the monitor nearest the pointer."""
+
+            # Tk's multi-monitor support on Windows is limited to the primary display
+            # when querying ``winfo_screenwidth``/``winfo_screenheight``.  We fall back
+            # to the Windows API so the popup can be constrained to whichever monitor
+            # currently hosts the cursor.
+            import sys
+
+            if sys.platform != "win32":
+                return None
+
+            try:
+                import ctypes
+                from ctypes import wintypes
+            except Exception:  # pragma: no cover - only executed on Windows
+                return None
+
+            MONITOR_DEFAULTTONEAREST = 2
+
+            user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+
+            class MONITORINFO(ctypes.Structure):  # pragma: no cover - Windows only
+                _fields_ = [
+                    ("cbSize", wintypes.DWORD),
+                    ("rcMonitor", wintypes.RECT),
+                    ("rcWork", wintypes.RECT),
+                    ("dwFlags", wintypes.DWORD),
+                ]
+
+            monitor = user32.MonitorFromPoint(  # pragma: no cover - Windows only
+                wintypes.POINT(pointer_x, pointer_y),
+                MONITOR_DEFAULTTONEAREST,
+            )
+            if not monitor:
+                return None
+
+            info = MONITORINFO()
+            info.cbSize = ctypes.sizeof(MONITORINFO)
+            if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                return None
+
+            work = info.rcWork
+            return work.left, work.top, work.right, work.bottom
+
         def place_near_pointer() -> None:
             window.update_idletasks()
             width = window.winfo_width() or window.winfo_reqwidth()
             height = window.winfo_height() or window.winfo_reqheight()
-            pointer_x = window.winfo_pointerx() - width // 2
-            pointer_y = window.winfo_pointery() - height // 2
-            screen_width = window.winfo_screenwidth()
-            screen_height = window.winfo_screenheight()
-            x = min(max(pointer_x, 0), max(screen_width - width, 0))
-            y = min(max(pointer_y, 0), max(screen_height - height, 0))
+            pointer_x = window.winfo_pointerx()
+            pointer_y = window.winfo_pointery()
+
+            bounds = _monitor_work_area(pointer_x, pointer_y)
+            if bounds is None:
+                left, top = 0, 0
+                right = window.winfo_screenwidth()
+                bottom = window.winfo_screenheight()
+            else:
+                left, top, right, bottom = bounds
+
+            target_x = pointer_x - width // 2
+            target_y = pointer_y - height // 2
+
+            max_x = max(right - width, left)
+            max_y = max(bottom - height, top)
+            x = min(max(target_x, left), max_x)
+            y = min(max(target_y, top), max_y)
             window.geometry(f"+{x}+{y}")
 
         def bring_to_front() -> None:
