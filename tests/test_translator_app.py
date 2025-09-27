@@ -132,6 +132,33 @@ class CCTranslationAppTests(unittest.TestCase):
         app.stop()
         self.assertTrue(app._stop_event.is_set())
 
+    def test_reboot_resets_internal_state(self):
+        translator = FakeTranslator()
+        app = self._create_app(translator_factory=lambda: translator)
+        _ = app.translator  # instantiate translator instance
+
+        app._handle_copy_event()
+        app._fake_time.advance(0.1)
+        app._handle_copy_event()
+        request = app._request_queue.get_nowait()
+        self.assertEqual(request.text, "hello")
+
+        app.reboot()
+
+        self.assertTrue(app._restart_event.is_set())
+        self.assertTrue(app._stop_event.is_set())
+        self.assertIsNone(app._translator)
+        self.assertTrue(app._request_queue.empty())
+
+        app._restart_event.clear()
+        app._stop_event.clear()
+
+        app._handle_copy_event()
+        app._fake_time.advance(0.1)
+        app._handle_copy_event()
+        request_after_reboot = app._request_queue.get_nowait()
+        self.assertEqual(request_after_reboot.text, "hello")
+
 
 if __name__ == "__main__":
     unittest.main()
