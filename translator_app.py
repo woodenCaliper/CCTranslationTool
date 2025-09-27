@@ -94,6 +94,12 @@ class DoubleCopyDetector:
             return True
         return False
 
+    def reset(self) -> None:
+        """Reset the detector state so future copies restart the sequence."""
+
+        self._last_time = 0.0
+        self._count = 0
+
 
 class TranslationWindowManager:
     """Create and reuse a single Tk window for displaying translations."""
@@ -450,7 +456,17 @@ class CCTranslationApp:
     def _handle_copy_event(self) -> None:
         with self._lock:
             if self._copy_detector.register():
-                text = self._clipboard.paste().strip()
+                try:
+                    text = self._clipboard.paste()
+                except Exception as exc:  # pragma: no cover - exercised via unit tests
+                    if pyperclip is not None and isinstance(exc, pyperclip.PyperclipException):
+                        message = f"Failed to read clipboard: {exc}"
+                    else:
+                        message = f"Unexpected error while accessing clipboard: {exc}"
+                    print(message)
+                    self._copy_detector.reset()
+                    return
+                text = text.strip()
                 if text:
                     self._request_queue.put(
                         TranslationRequest(text=text, src=self.source_language, dest=self.dest_language)

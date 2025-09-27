@@ -1,6 +1,32 @@
+import io
 import queue
+import sys
+import types
 import unittest
+from contextlib import redirect_stdout
 from types import SimpleNamespace
+
+if "pystray" not in sys.modules:
+    stub_pystray = types.ModuleType("pystray")
+
+    class _StubIcon:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def run_detached(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    class _StubMenuItem:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    stub_pystray.Icon = _StubIcon
+    stub_pystray.Menu = lambda *args, **kwargs: None
+    stub_pystray.MenuItem = _StubMenuItem
+    sys.modules["pystray"] = stub_pystray
 
 from translator_app import CCTranslationApp, TranslationRequest
 from translation_service import TranslationError
@@ -131,6 +157,38 @@ class CCTranslationAppTests(unittest.TestCase):
         self.assertFalse(app._stop_event.is_set())
         app.stop()
         self.assertTrue(app._stop_event.is_set())
+
+    def test_clipboard_error_does_not_enqueue_and_recovers(self):
+        class LockedClipboard(FakeClipboard):
+            def __init__(self) -> None:
+                super().__init__("hello")
+                self.locked = True
+
+            def paste(self) -> str:
+                if self.locked:
+                    raise RuntimeError("clipboard locked")
+                return super().paste()
+
+        clipboard = LockedClipboard()
+        app = self._create_app(clipboard_module=clipboard)
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            app._handle_copy_event()
+            app._fake_time.advance(0.1)
+            app._handle_copy_event()
+
+        self.assertTrue(app._request_queue.empty())
+        self.assertIn("clipboard", buffer.getvalue().lower())
+
+        clipboard.locked = False
+        app._fake_time.advance(0.1)
+        app._handle_copy_event()
+        app._fake_time.advance(0.1)
+        app._handle_copy_event()
+
+        request = app._request_queue.get_nowait()
+        self.assertEqual(request.text, "hello")
 
 
 if __name__ == "__main__":
