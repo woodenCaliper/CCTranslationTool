@@ -2,6 +2,7 @@ import io
 import queue
 import threading
 import sys
+import threading
 import types
 import unittest
 import unittest.mock as mock
@@ -84,7 +85,7 @@ class ErroringTranslator:
         raise TranslationError("boom")
 
 
-class CCTranslationAppTests(unittest.TestCase):
+class CCTranslationAppTestMixin:
     def _create_app(self, **overrides) -> CCTranslationApp:
         fake_time = overrides.pop("fake_time", None)
         if fake_time is None:
@@ -104,6 +105,8 @@ class CCTranslationAppTests(unittest.TestCase):
         app._fake_time = fake_time
         return app
 
+
+class CCTranslationAppTests(CCTranslationAppTestMixin, unittest.TestCase):
     def test_single_copy_does_not_enqueue(self):
         app = self._create_app()
         app._handle_copy_event()
@@ -269,6 +272,42 @@ class CCTranslationAppTests(unittest.TestCase):
             raise exceptions[0]
 
         self.assertEqual(translator.calls, [("hello", None, "ja")])
+
+
+class CCTranslationAppLifecycleTests(CCTranslationAppTestMixin, unittest.TestCase):
+    def test_stop_after_reboot_exits_start_loop(self):
+        app = self._create_app()
+
+        ready = threading.Event()
+
+        class FakeTrayController:
+            def __init__(self) -> None:
+                self.start_calls = 0
+                self.stop_calls = 0
+
+            def start(self) -> None:
+                self.start_calls += 1
+                ready.set()
+
+            def stop(self) -> None:
+                self.stop_calls += 1
+
+        tray = FakeTrayController()
+
+        thread = threading.Thread(target=lambda: app.start(tray_controller=tray))
+        thread.start()
+        try:
+            self.assertTrue(ready.wait(timeout=1), "App did not reach running state in time")
+
+            ready.clear()
+            app.reboot()
+            app.stop()
+
+            thread.join(timeout=1)
+            self.assertFalse(thread.is_alive(), "App should exit after stop following reboot")
+        finally:
+            app.stop()
+            thread.join(timeout=1)
 
 
 if __name__ == "__main__":
