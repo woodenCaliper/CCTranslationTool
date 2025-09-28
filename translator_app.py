@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import queue
 import threading
 import time
@@ -405,19 +406,85 @@ class TranslationWindowManager:
         dest_button.pack(side=tk.LEFT, expand=True, fill=tk.X)
         self._dest_button = dest_button
 
-        original_label = tk.Label(window, text="Original", font=label_font)
-        original_label.pack(anchor="w", padx=10)
+        content_pane = tk.PanedWindow(window, orient=tk.VERTICAL, sashwidth=6)
+        content_pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
-        original_box = scrolledtext.ScrolledText(window, wrap=tk.WORD, height=8)
+        original_section = tk.Frame(content_pane)
+        original_label = tk.Label(original_section, text="Original", font=label_font)
+        original_label.pack(anchor="w", pady=(0, 4))
+
+        original_box = scrolledtext.ScrolledText(original_section, wrap=tk.WORD, height=1)
         original_box.configure(state=tk.DISABLED, font=text_font)
-        original_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        original_box.pack(fill=tk.BOTH, expand=True)
 
-        translated_label = tk.Label(window, text="Translated", font=label_font)
-        translated_label.pack(anchor="w", padx=10)
+        translated_section = tk.Frame(content_pane)
+        translated_label = tk.Label(translated_section, text="Translated", font=label_font)
+        translated_label.pack(anchor="w", pady=(0, 4))
 
-        translated_box = scrolledtext.ScrolledText(window, wrap=tk.WORD, height=8)
+        translated_box = scrolledtext.ScrolledText(translated_section, wrap=tk.WORD, height=8)
         translated_box.configure(state=tk.DISABLED, font=text_font)
-        translated_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        translated_box.pack(fill=tk.BOTH, expand=True)
+        content_pane.add(original_section, stretch="always", minsize=80)
+        content_pane.add(translated_section, stretch="always", minsize=120)
+
+        resize_job: Optional[str] = None
+
+        def resize_text_widget(widget: tk.Text, *, min_lines: int = 1, max_lines: int = 15) -> None:
+            """Adjust the text widget height based on its current content."""
+
+            widget.update_idletasks()
+
+            text = widget.get("1.0", "end-1c")
+
+            # Step 1: count the characters to translate.
+            char_count = len(text)
+            if char_count == 0:
+                widget.configure(height=min_lines)
+                return
+
+            # Step 2: estimate how many characters fit on one line using the
+            # current window width and the active font metrics.
+            window = widget.winfo_toplevel()
+            window_width = window.winfo_width()
+            if window_width <= 1:
+                window_width = window.winfo_reqwidth()
+
+            font = tkfont.Font(font=widget.cget("font"))
+            # Measure a representative wide character and fall back to 1px.
+            sample_width = max(font.measure("W"), font.measure("あ"), 1)
+
+            if window_width <= 1 or sample_width <= 0:
+                widget.configure(height=min_lines)
+                return
+
+            chars_per_line = max(window_width // sample_width, 1)
+
+            # Step 3: compute the number of lines needed and apply the result.
+            lines_needed = 0
+            for segment in text.split("\n"):
+                segment_length = len(segment)
+                if segment_length == 0:
+                    lines_needed += 1
+                    continue
+                lines_needed += math.ceil(segment_length / chars_per_line)
+
+            display_lines = max(min_lines, min(lines_needed, max_lines))
+            widget.configure(height=display_lines)
+
+        def schedule_resize(widget: tk.Text, *, min_lines: int = 1, max_lines: int = 15) -> None:
+            """Schedule a resize after idle to account for geometry updates."""
+
+            nonlocal resize_job
+
+            if resize_job is not None:
+                window.after_cancel(resize_job)
+
+            def _apply_resize() -> None:
+                nonlocal resize_job
+                resize_job = None
+                resize_text_widget(widget, min_lines=min_lines, max_lines=max_lines)
+
+            resize_job = window.after_idle(_apply_resize)
 
         def hide_window() -> None:
             window.withdraw()
@@ -573,6 +640,7 @@ class TranslationWindowManager:
                     original_box.delete("1.0", tk.END)
                     original_box.insert(tk.END, original)
                     original_box.configure(state=tk.DISABLED)
+                    schedule_resize(original_box)
                     translated_box.configure(state=tk.NORMAL)
                     translated_box.delete("1.0", tk.END)
                     translated_box.insert(tk.END, translated)
