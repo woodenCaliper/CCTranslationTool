@@ -3,6 +3,7 @@ import queue
 import sys
 import types
 import unittest
+import unittest.mock as mock
 from contextlib import redirect_stdout
 from types import SimpleNamespace
 
@@ -123,6 +124,38 @@ class CCTranslationAppTests(unittest.TestCase):
         app._handle_copy_event()
         with self.assertRaises(queue.Empty):
             app._request_queue.get_nowait()
+
+    def test_set_dest_language_retranslates_last_text(self):
+        app = self._create_app()
+        app._process_single_request(TranslationRequest(text="hello", src=None, dest="ja"))
+        with mock.patch("translator_app._save_dest_language"):
+            app._set_dest_language("en")
+        request = app._request_queue.get_nowait()
+        self.assertEqual(request.text, "hello")
+        self.assertIsNone(request.src)
+        self.assertEqual(request.dest, "en")
+
+    def test_toggle_language_retranslates_last_text(self):
+        app = self._create_app()
+        app.source_language = "en"
+        app.dest_language = "ja"
+        app._process_single_request(TranslationRequest(text="こんにちは", src="en", dest="ja"))
+        with mock.patch("translator_app._save_dest_language"):
+            app._toggle_language()
+        request = app._request_queue.get_nowait()
+        self.assertEqual(request.text, "こんにちは")
+        self.assertEqual(request.src, "ja")
+        self.assertEqual(request.dest, "en")
+
+    def test_set_source_language_retranslates_last_text(self):
+        app = self._create_app()
+        app.dest_language = "en"
+        app._process_single_request(TranslationRequest(text="hello", src=None, dest="en"))
+        app._set_source_language("ja")
+        request = app._request_queue.get_nowait()
+        self.assertEqual(request.text, "hello")
+        self.assertEqual(request.src, "ja")
+        self.assertEqual(request.dest, "en")
 
     def test_process_single_request_uses_translator(self):
         translator = FakeTranslator(translated="translated", detected="en")

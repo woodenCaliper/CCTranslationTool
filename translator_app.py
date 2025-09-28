@@ -616,6 +616,7 @@ class CCTranslationApp:
         )
         self._tray_controller: Optional[SystemTrayController] = None
         self._language_options = list(LANGUAGE_SEQUENCE)
+        self._last_original_text: Optional[str] = None
 
     @property
     def translator(self) -> TranslatorProtocol:
@@ -663,6 +664,10 @@ class CCTranslationApp:
                 self.dest_language = self._language_options[next_index]
             self._window_manager.update_languages(self.source_language, self.dest_language)
             _save_dest_language(self.dest_language)
+            last_text = self._last_original_text
+            src = self.source_language
+            dest = self.dest_language
+        self._enqueue_retranslation(last_text, src, dest)
 
     def _set_dest_language(self, language: str) -> None:
         with self._lock:
@@ -671,11 +676,19 @@ class CCTranslationApp:
                 self._language_options.append(language)
             self._window_manager.update_languages(self.source_language, self.dest_language)
             _save_dest_language(self.dest_language)
+            last_text = self._last_original_text
+            src = self.source_language
+            dest = self.dest_language
+        self._enqueue_retranslation(last_text, src, dest)
 
     def _set_source_language(self, language: Optional[str]) -> None:
         with self._lock:
             self.source_language = language
             self._window_manager.update_languages(self.source_language, self.dest_language)
+            last_text = self._last_original_text
+            src = self.source_language
+            dest = self.dest_language
+        self._enqueue_retranslation(last_text, src, dest)
 
     def _handle_copy_event(self) -> None:
         with self._lock:
@@ -705,6 +718,8 @@ class CCTranslationApp:
                 self._request_queue.task_done()
 
     def _process_single_request(self, request: TranslationRequest) -> None:
+        with self._lock:
+            self._last_original_text = request.text
         try:
             translation = self.translator.translate(request.text, src=request.src, dest=request.dest)
         except TranslationError as exc:  # pragma: no cover - network errors are runtime issues
@@ -723,6 +738,13 @@ class CCTranslationApp:
 
     def _show_translation_window(self, original: str, translated: str, detected_source: Optional[str]) -> None:
         self._window_manager.show(original, translated, detected_source)
+
+    def _enqueue_retranslation(
+        self, text: Optional[str], src: Optional[str], dest: Optional[str]
+    ) -> None:
+        if not text or not dest:
+            return
+        self._request_queue.put(TranslationRequest(text=text, src=src, dest=dest))
 
 
 def parse_args() -> argparse.Namespace:
