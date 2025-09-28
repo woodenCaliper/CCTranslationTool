@@ -583,6 +583,8 @@ class CCTranslationApp:
         self._lock = threading.Lock()
         self._request_queue: "queue.Queue[TranslationRequest]" = queue.Queue()
         self._stop_event = threading.Event()
+        self._restart_event = threading.Event()
+        self._worker_thread: Optional[threading.Thread] = None
         if keyboard_module is None:
             raise RuntimeError(
                 "The 'keyboard' package is required. Install it with 'pip install keyboard'."
@@ -615,27 +617,46 @@ class CCTranslationApp:
         """Start listening for keyboard events and processing translations."""
 
         self._tray_controller = tray_controller
-        self._keyboard.add_hotkey("ctrl+c", self._handle_copy_event, suppress=False)
 
-        worker = threading.Thread(target=self._process_requests, daemon=True)
-        worker.start()
+        if self._worker_thread is None or not self._worker_thread.is_alive():
+            self._worker_thread = threading.Thread(target=self._process_requests, daemon=True)
+            self._worker_thread.start()
 
-        print("CCTranslationTool is running. Double press Ctrl+C on selected text to translate.")
-        if self._tray_controller is not None:
-            self._tray_controller.start()
+        while True:
+            self._keyboard.add_hotkey("ctrl+c", self._handle_copy_event, suppress=False)
 
-        try:
-            self._stop_event.wait()
-        except KeyboardInterrupt:  # pragma: no cover - manual console interruption
-            self.stop()
-        finally:
-            self._keyboard.unhook_all()
+            print(
+                "CCTranslationTool is running. Double press Ctrl+C on selected text to translate."
+            )
             if self._tray_controller is not None:
-                self._tray_controller.stop()
+                self._tray_controller.start()
+
+            try:
+                self._stop_event.wait()
+            except KeyboardInterrupt:  # pragma: no cover - manual console interruption
+                self.stop()
+            finally:
+                self._keyboard.unhook_all()
+                if self._tray_controller is not None:
+                    self._tray_controller.stop()
+
+            if self._restart_event.is_set():
+                self._restart_event.clear()
+                self._stop_event.clear()
+                continue
+
+            break
 
     def stop(self) -> None:
         """Signal the application to shut down."""
 
+        self._restart_event.clear()
+        self._stop_event.set()
+
+    def reboot(self) -> None:
+        """Restart the application loop by reinitialising keyboard listeners."""
+
+        self._restart_event.set()
         self._stop_event.set()
 
     def _toggle_language(self) -> None:
