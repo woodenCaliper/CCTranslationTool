@@ -408,9 +408,9 @@ class TranslationWindowManager:
         original_label = tk.Label(window, text="Original", font=label_font)
         original_label.pack(anchor="w", padx=10)
 
-        original_box = scrolledtext.ScrolledText(window, wrap=tk.WORD, height=8)
+        original_box = scrolledtext.ScrolledText(window, wrap=tk.WORD, height=1)
         original_box.configure(state=tk.DISABLED, font=text_font)
-        original_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        original_box.pack(fill=tk.X, padx=10, pady=(0, 10))
 
         translated_label = tk.Label(window, text="Translated", font=label_font)
         translated_label.pack(anchor="w", padx=10)
@@ -418,6 +418,17 @@ class TranslationWindowManager:
         translated_box = scrolledtext.ScrolledText(window, wrap=tk.WORD, height=8)
         translated_box.configure(state=tk.DISABLED, font=text_font)
         translated_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        def resize_text_widget(widget: tk.Text, *, min_lines: int = 1, max_lines: int = 15) -> None:
+            """Adjust the text widget height based on its current content."""
+
+            try:
+                display_lines = widget.count("1.0", "end-1c", "displaylines")[0]
+            except tk.TclError:
+                display_lines = int(float(widget.index("end-1c")))
+
+            display_lines = max(min_lines, min(display_lines, max_lines))
+            widget.configure(height=display_lines)
 
         def hide_window() -> None:
             window.withdraw()
@@ -572,6 +583,7 @@ class TranslationWindowManager:
                     original_box.configure(state=tk.NORMAL)
                     original_box.delete("1.0", tk.END)
                     original_box.insert(tk.END, original)
+                    resize_text_widget(original_box)
                     original_box.configure(state=tk.DISABLED)
                     translated_box.configure(state=tk.NORMAL)
                     translated_box.delete("1.0", tk.END)
