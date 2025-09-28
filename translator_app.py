@@ -144,6 +144,8 @@ class TranslationWindowManager:
         dest_language: str,
         *,
         language_toggle_callback: Optional[Callable[[], None]] = None,
+        source_language_callback: Optional[Callable[[Optional[str]], None]] = None,
+        dest_language_callback: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._source_language = source_language
         self._dest_language = dest_language
@@ -151,9 +153,13 @@ class TranslationWindowManager:
         self._ready = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._language_toggle_callback = language_toggle_callback
+        self._source_language_callback = source_language_callback
+        self._dest_language_callback = dest_language_callback
         self._window: Optional[tk.Tk] = None
         self._header_label: Optional[tk.Label] = None
-        self._language_button: Optional[tk.Button] = None
+        self._toggle_button: Optional[tk.Button] = None
+        self._source_button: Optional[tk.Button] = None
+        self._dest_button: Optional[tk.Button] = None
 
     def show(self, original: str, translated: str, detected_source: Optional[str]) -> None:
         if self._thread is None or not self._thread.is_alive():
@@ -170,18 +176,89 @@ class TranslationWindowManager:
             self._window.after(0, self._update_language_widgets)
 
     def _update_language_widgets(self) -> None:
-        if self._language_button is not None:
-            self._language_button.configure(text=self._language_button_text())
+        if self._source_button is not None:
+            self._source_button.configure(text=self._source_button_text())
+        if self._dest_button is not None:
+            self._dest_button.configure(text=self._dest_button_text())
         if self._header_label is not None:
             self._header_label.configure(text=self._build_header_text(None))
 
-    def _language_button_text(self) -> str:
+    def _source_button_text(self) -> str:
+        display = _language_display(self._source_language or "auto")
+        return f"検出言語: {display}"
+
+    def _dest_button_text(self) -> str:
         dest_label = _language_display(self._dest_language)
-        return f"翻訳先: {dest_label}（切替）"
+        return f"翻訳先: {dest_label}"
+
+    def _toggle_button_style(self, button: tk.Button) -> None:
+        button.configure(
+            text="⇄",
+            font=("Segoe UI", 14, "bold"),
+            width=3,
+            bg="#1a73e8",
+            fg="white",
+            activebackground="#1765c1",
+            activeforeground="white",
+            relief=tk.FLAT,
+            bd=0,
+            highlightthickness=0,
+            cursor="hand2",
+        )
+
+    def _on_source_language_selected(self, selection: Optional[str]) -> None:
+        self._source_language = selection
+        if self._source_language_callback is not None:
+            self._source_language_callback(selection)
+        self._update_language_widgets()
+
+    def _on_dest_language_selected(self, selection: str) -> None:
+        self._dest_language = selection
+        if self._dest_language_callback is not None:
+            self._dest_language_callback(selection)
+        self._update_language_widgets()
 
     def _on_language_toggle(self) -> None:
         if self._language_toggle_callback is not None:
             self._language_toggle_callback()
+
+    def _open_source_menu(self, widget: tk.Widget) -> None:
+        if self._window is None:
+            return
+        menu = tk.Menu(self._window, tearoff=0)
+        options: tuple[Optional[str], ...] = (None, "ja", "en")
+        for code in options:
+            label = _language_display(code or "auto")
+            menu.add_command(
+                label=label,
+                command=lambda c=code: self._on_source_language_selected(c),
+            )
+        try:
+            menu.tk_popup(
+                widget.winfo_rootx(),
+                widget.winfo_rooty() + widget.winfo_height(),
+            )
+        finally:
+            menu.grab_release()
+
+    def _open_dest_menu(self, widget: tk.Widget) -> None:
+        if self._window is None:
+            return
+        menu = tk.Menu(self._window, tearoff=0)
+        options: tuple[str, ...] = ("ja", "en")
+        for code in options:
+            label = _language_display(code)
+            menu.add_command(
+                label=label,
+                command=lambda c=code: self._on_dest_language_selected(c),
+            )
+        try:
+            menu.tk_popup(
+                widget.winfo_rootx(),
+                widget.winfo_rooty() + widget.winfo_height(),
+            )
+        finally:
+            menu.grab_release()
 
     def _run_window(self) -> None:
         window = tk.Tk()
@@ -190,9 +267,44 @@ class TranslationWindowManager:
         window.geometry("500x400")
         window.withdraw()
 
-        language_button = tk.Button(window, text=self._language_button_text(), command=self._on_language_toggle)
-        language_button.pack(pady=(10, 5))
-        self._language_button = language_button
+        controls_frame = tk.Frame(window, bg="#f8f9fa")
+        controls_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
+
+        source_button = tk.Button(
+            controls_frame,
+            text=self._source_button_text(),
+            font=("Segoe UI", 11),
+            relief=tk.SOLID,
+            bd=1,
+            bg="white",
+            activebackground="#e8f0fe",
+            cursor="hand2",
+            command=lambda: self._open_source_menu(source_button),
+        )
+        source_button.pack(side=tk.LEFT, expand=True, fill=tk.X)
+        self._source_button = source_button
+
+        toggle_button = tk.Button(
+            controls_frame,
+            command=self._on_language_toggle,
+        )
+        self._toggle_button_style(toggle_button)
+        toggle_button.pack(side=tk.LEFT, padx=8)
+        self._toggle_button = toggle_button
+
+        dest_button = tk.Button(
+            controls_frame,
+            text=self._dest_button_text(),
+            font=("Segoe UI", 11),
+            relief=tk.SOLID,
+            bd=1,
+            bg="white",
+            activebackground="#e8f0fe",
+            cursor="hand2",
+            command=lambda: self._open_dest_menu(dest_button),
+        )
+        dest_button.pack(side=tk.LEFT, expand=True, fill=tk.X)
+        self._dest_button = dest_button
 
         header = tk.Label(
             window,
@@ -385,7 +497,9 @@ class TranslationWindowManager:
         window.mainloop()
         self._window = None
         self._header_label = None
-        self._language_button = None
+        self._toggle_button = None
+        self._source_button = None
+        self._dest_button = None
 
     def _build_header_text(self, detected_source: Optional[str]) -> str:
         detected = detected_source or self._source_language or "auto"
@@ -497,9 +611,11 @@ class CCTranslationApp:
             self.source_language,
             self.dest_language,
             language_toggle_callback=self._toggle_language,
+            source_language_callback=self._set_source_language,
+            dest_language_callback=self._set_dest_language,
         )
         self._tray_controller: Optional[SystemTrayController] = None
-        self._language_cycle = LANGUAGE_SEQUENCE
+        self._language_options = list(LANGUAGE_SEQUENCE)
 
     @property
     def translator(self) -> TranslatorProtocol:
@@ -536,14 +652,30 @@ class CCTranslationApp:
 
     def _toggle_language(self) -> None:
         with self._lock:
-            try:
-                current_index = self._language_cycle.index(self.dest_language)
-            except ValueError:
-                current_index = -1
-            next_index = (current_index + 1) % len(self._language_cycle)
-            self.dest_language = self._language_cycle[next_index]
+            if self.source_language and self.dest_language:
+                self.source_language, self.dest_language = self.dest_language, self.source_language
+            else:
+                try:
+                    current_index = self._language_options.index(self.dest_language)
+                except ValueError:
+                    current_index = -1
+                next_index = (current_index + 1) % len(self._language_options)
+                self.dest_language = self._language_options[next_index]
             self._window_manager.update_languages(self.source_language, self.dest_language)
             _save_dest_language(self.dest_language)
+
+    def _set_dest_language(self, language: str) -> None:
+        with self._lock:
+            self.dest_language = language
+            if language not in self._language_options:
+                self._language_options.append(language)
+            self._window_manager.update_languages(self.source_language, self.dest_language)
+            _save_dest_language(self.dest_language)
+
+    def _set_source_language(self, language: Optional[str]) -> None:
+        with self._lock:
+            self.source_language = language
+            self._window_manager.update_languages(self.source_language, self.dest_language)
 
     def _handle_copy_event(self) -> None:
         with self._lock:
