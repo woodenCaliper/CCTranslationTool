@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import queue
 import threading
@@ -10,7 +11,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Callable, Optional, Protocol
+from typing import IO, Callable, Optional, Protocol
 
 try:  # pragma: no cover - executed during module import
     import keyboard  # type: ignore
@@ -24,7 +25,7 @@ except ImportError:  # pragma: no cover - handled in __init__
 
 try:
     import tkinter as tk
-    from tkinter import scrolledtext
+    from tkinter import messagebox, scrolledtext
 except ImportError as exc:  # pragma: no cover - tkinter is part of stdlib on Windows
     raise SystemExit("tkinter is required to display the translation window") from exc
 
@@ -42,6 +43,7 @@ except ImportError:  # pragma: no cover - handled when starting the tray icon
     ImageDraw = None  # type: ignore
 
 import sys
+import tempfile
 
 from translation_service import GoogleTranslateClient, TranslationError, TranslationResult
 
@@ -134,6 +136,71 @@ class DoubleCopyDetector:
 
         self._last_time = 0.0
         self._count = 0
+
+
+class SingleInstanceError(RuntimeError):
+    """Raised when another instance of the application is already running."""
+
+
+class SingleInstanceGuard:
+    """Cross-platform single instance guard using a filesystem lock."""
+
+    def __init__(self, name: str) -> None:
+        self._lock_path = Path(tempfile.gettempdir()) / f"{name}.lock"
+        self._lock_file: Optional[IO[str]] = None
+
+    def acquire(self) -> None:
+        if self._lock_file is not None:
+            return
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock_file = open(self._lock_path, "a+")
+        try:
+            if sys.platform == "win32":  # pragma: no cover - platform specific
+                import msvcrt  # type: ignore
+
+                self._lock_file.seek(0)
+                msvcrt.locking(self._lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            else:  # pragma: no cover - exercised on non-Windows platforms
+                import fcntl  # type: ignore
+
+                fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            self.release()
+            raise SingleInstanceError("Another instance is already running") from exc
+
+    def release(self) -> None:
+        if self._lock_file is None:
+            return
+        try:
+            if sys.platform == "win32":  # pragma: no cover - platform specific
+                import msvcrt  # type: ignore
+
+                self._lock_file.seek(0)
+                try:
+                    msvcrt.locking(self._lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            else:  # pragma: no cover - exercised on non-Windows platforms
+                import fcntl  # type: ignore
+
+                try:
+                    fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+        finally:
+            try:
+                self._lock_file.close()
+            finally:
+                self._lock_file = None
+                with contextlib.suppress(OSError):
+                    self._lock_path.unlink()
+
+    def __enter__(self) -> "SingleInstanceGuard":
+        self.acquire()
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.release()
 
 
 class TranslationWindowManager:
@@ -781,11 +848,18 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    args = parse_args()
-    _save_dest_language(args.dest)
-    app = CCTranslationApp(dest_language=args.dest, source_language=args.src)
-    tray_controller = SystemTrayController(app)
-    app.start(tray_controller=tray_controller)
+    try:
+        with SingleInstanceGuard("cctranslationtool"):
+            args = parse_args()
+            _save_dest_language(args.dest)
+            app = CCTranslationApp(dest_language=args.dest, source_language=args.src)
+            tray_controller = SystemTrayController(app)
+            app.start(tray_controller=tray_controller)
+    except SingleInstanceError:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo("CCTranslationTool", "CCTranslationToolは既に起動しています。")
+        root.destroy()
 
 
 if __name__ == "__main__":
