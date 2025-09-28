@@ -273,6 +273,32 @@ class CCTranslationAppTests(CCTranslationAppTestMixin, unittest.TestCase):
 
         self.assertEqual(translator.calls, [("hello", None, "ja")])
 
+    def test_reboot_resets_translator_and_requests_restart(self):
+        translators = []
+
+        def factory() -> FakeTranslator:
+            translator = FakeTranslator(translated=f"translated-{len(translators)}")
+            translators.append(translator)
+            return translator
+
+        app = self._create_app(translator_factory=factory)
+
+        request = TranslationRequest(text="hello", src=None, dest="ja")
+        app._process_single_request(request)
+        self.assertEqual(len(translators), 1, "translator_factory should have been called once")
+
+        app.reboot()
+
+        self.assertTrue(app._restart_event.is_set())
+        self.assertTrue(app._stop_event.is_set())
+
+        app._restart_event.clear()
+        app._stop_event.clear()
+
+        app._process_single_request(request)
+        self.assertEqual(len(translators), 2, "reboot should clear cached translator")
+        self.assertIsNot(translators[0], translators[1])
+
 
 class CCTranslationAppLifecycleTests(CCTranslationAppTestMixin, unittest.TestCase):
     def test_stop_after_reboot_exits_start_loop(self):
