@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import queue
 import threading
 import time
@@ -46,6 +47,39 @@ from translation_service import GoogleTranslateClient, TranslationError, Transla
 
 
 DOUBLE_COPY_INTERVAL = 0.5  # Seconds allowed between two copy events.
+
+PREFERENCES_FILE = Path.home() / ".cctranslationtool_preferences.json"
+
+LANGUAGE_SEQUENCE = ("ja", "en")
+LANGUAGE_DISPLAY_NAMES = {
+    "ja": "日本語",
+    "en": "英語",
+    "auto": "自動検出",
+    None: "自動検出",
+}
+
+
+def _load_saved_dest_language(default: str = "ja") -> str:
+    try:
+        data = json.loads(PREFERENCES_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return default
+    dest = data.get("dest_language") if isinstance(data, dict) else None
+    return dest if isinstance(dest, str) else default
+
+
+def _save_dest_language(dest: str) -> None:
+    try:
+        PREFERENCES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PREFERENCES_FILE.write_text(json.dumps({"dest_language": dest}), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _language_display(language_code: Optional[str]) -> str:
+    if language_code is None:
+        return LANGUAGE_DISPLAY_NAMES[None]
+    return LANGUAGE_DISPLAY_NAMES.get(language_code, language_code)
 
 
 def _resource_path(relative_path: str) -> Path:
@@ -104,12 +138,22 @@ class DoubleCopyDetector:
 class TranslationWindowManager:
     """Create and reuse a single Tk window for displaying translations."""
 
-    def __init__(self, source_language: Optional[str], dest_language: str) -> None:
+    def __init__(
+        self,
+        source_language: Optional[str],
+        dest_language: str,
+        *,
+        language_toggle_callback: Optional[Callable[[], None]] = None,
+    ) -> None:
         self._source_language = source_language
         self._dest_language = dest_language
         self._queue: "queue.Queue[tuple[str, str, Optional[str]]]" = queue.Queue()
         self._ready = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._language_toggle_callback = language_toggle_callback
+        self._window: Optional[tk.Tk] = None
+        self._header_label: Optional[tk.Label] = None
+        self._language_button: Optional[tk.Button] = None
 
     def show(self, original: str, translated: str, detected_source: Optional[str]) -> None:
         if self._thread is None or not self._thread.is_alive():
@@ -119,19 +163,45 @@ class TranslationWindowManager:
             self._ready.wait()
         self._queue.put((original, translated, detected_source))
 
+    def update_languages(self, source_language: Optional[str], dest_language: str) -> None:
+        self._source_language = source_language
+        self._dest_language = dest_language
+        if self._window is not None:
+            self._window.after(0, self._update_language_widgets)
+
+    def _update_language_widgets(self) -> None:
+        if self._language_button is not None:
+            self._language_button.configure(text=self._language_button_text())
+        if self._header_label is not None:
+            self._header_label.configure(text=self._build_header_text(None))
+
+    def _language_button_text(self) -> str:
+        dest_label = _language_display(self._dest_language)
+        return f"翻訳先: {dest_label}（切替）"
+
+    def _on_language_toggle(self) -> None:
+        if self._language_toggle_callback is not None:
+            self._language_toggle_callback()
+
     def _run_window(self) -> None:
         window = tk.Tk()
+        self._window = window
         window.title("CCTranslationTool")
         window.geometry("500x400")
         window.withdraw()
 
+        language_button = tk.Button(window, text=self._language_button_text(), command=self._on_language_toggle)
+        language_button.pack(pady=(10, 5))
+        self._language_button = language_button
+
         header = tk.Label(
             window,
-            text="",
+            text=self._build_header_text(None),
             font=("Segoe UI", 12, "bold"),
             wraplength=480,
         )
-        header.pack(pady=(10, 5))
+        header.pack(pady=(0, 5))
+        self._header_label = header
 
         original_label = tk.Label(window, text="Original", font=("Segoe UI", 10, "bold"))
         original_label.pack(anchor="w", padx=10)
@@ -296,12 +366,7 @@ class TranslationWindowManager:
             try:
                 while True:
                     original, translated, detected_source = self._queue.get_nowait()
-                    header.configure(
-                        text=(
-                            f"Detected source: {detected_source or self._source_language or 'auto'} "
-                            f"→ {self._dest_language}"
-                        )
-                    )
+                    header.configure(text=self._build_header_text(detected_source))
                     original_box.configure(state=tk.NORMAL)
                     original_box.delete("1.0", tk.END)
                     original_box.insert(tk.END, original)
@@ -318,6 +383,17 @@ class TranslationWindowManager:
         self._ready.set()
         apply_update()
         window.mainloop()
+        self._window = None
+        self._header_label = None
+        self._language_button = None
+
+    def _build_header_text(self, detected_source: Optional[str]) -> str:
+        detected = detected_source or self._source_language or "auto"
+        detected_label = _language_display(detected)
+        dest_label = _language_display(self._dest_language)
+        if detected_source is None and self._source_language is None:
+            return f"翻訳先: {dest_label}"
+        return f"検出: {detected_label} → 翻訳先: {dest_label}"
 
 
 class SystemTrayController:
@@ -417,8 +493,13 @@ class CCTranslationApp:
         self._keyboard = keyboard_module
         self._clipboard = clipboard_module
         self._display_callback = display_callback
-        self._window_manager = TranslationWindowManager(self.source_language, self.dest_language)
+        self._window_manager = TranslationWindowManager(
+            self.source_language,
+            self.dest_language,
+            language_toggle_callback=self._toggle_language,
+        )
         self._tray_controller: Optional[SystemTrayController] = None
+        self._language_cycle = LANGUAGE_SEQUENCE
 
     @property
     def translator(self) -> TranslatorProtocol:
@@ -452,6 +533,17 @@ class CCTranslationApp:
         """Signal the application to shut down."""
 
         self._stop_event.set()
+
+    def _toggle_language(self) -> None:
+        with self._lock:
+            try:
+                current_index = self._language_cycle.index(self.dest_language)
+            except ValueError:
+                current_index = -1
+            next_index = (current_index + 1) % len(self._language_cycle)
+            self.dest_language = self._language_cycle[next_index]
+            self._window_manager.update_languages(self.source_language, self.dest_language)
+            _save_dest_language(self.dest_language)
 
     def _handle_copy_event(self) -> None:
         with self._lock:
@@ -505,8 +597,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Translate selected text after a double Ctrl+C.")
     parser.add_argument(
         "--dest",
-        default="ja",
-        help="Destination language (default: ja). Use Google Translate language codes.",
+        default=_load_saved_dest_language(),
+        help="Destination language (default: last saved or ja). Use Google Translate language codes.",
     )
     parser.add_argument(
         "--src",
@@ -518,6 +610,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    _save_dest_language(args.dest)
     app = CCTranslationApp(dest_language=args.dest, source_language=args.src)
     tray_controller = SystemTrayController(app)
     app.start(tray_controller=tray_controller)
