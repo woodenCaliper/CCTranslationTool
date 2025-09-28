@@ -405,19 +405,28 @@ class TranslationWindowManager:
         dest_button.pack(side=tk.LEFT, expand=True, fill=tk.X)
         self._dest_button = dest_button
 
-        original_label = tk.Label(window, text="Original", font=label_font)
-        original_label.pack(anchor="w", padx=10)
+        content_pane = tk.PanedWindow(window, orient=tk.VERTICAL, sashwidth=6)
+        content_pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
-        original_box = scrolledtext.ScrolledText(window, wrap=tk.WORD, height=8)
+        original_frame = tk.Frame(content_pane)
+        content_pane.add(original_frame, minsize=80)
+
+        original_label = tk.Label(original_frame, text="Original", font=label_font)
+        original_label.pack(anchor="w", pady=(0, 4))
+
+        original_box = scrolledtext.ScrolledText(original_frame, wrap=tk.WORD, height=8)
         original_box.configure(state=tk.DISABLED, font=text_font)
-        original_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        original_box.pack(fill=tk.BOTH, expand=True)
 
-        translated_label = tk.Label(window, text="Translated", font=label_font)
-        translated_label.pack(anchor="w", padx=10)
+        translated_frame = tk.Frame(content_pane)
+        content_pane.add(translated_frame, minsize=80)
 
-        translated_box = scrolledtext.ScrolledText(window, wrap=tk.WORD, height=8)
+        translated_label = tk.Label(translated_frame, text="Translated", font=label_font)
+        translated_label.pack(anchor="w", pady=(0, 4))
+
+        translated_box = scrolledtext.ScrolledText(translated_frame, wrap=tk.WORD, height=8)
         translated_box.configure(state=tk.DISABLED, font=text_font)
-        translated_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        translated_box.pack(fill=tk.BOTH, expand=True)
 
         def hide_window() -> None:
             window.withdraw()
