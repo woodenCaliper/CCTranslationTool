@@ -157,7 +157,6 @@ class TranslationWindowManager:
         self._source_language_callback = source_language_callback
         self._dest_language_callback = dest_language_callback
         self._window: Optional[tk.Tk] = None
-        self._header_label: Optional[tk.Label] = None
         self._toggle_button: Optional[tk.Button] = None
         self._source_button: Optional[tk.Button] = None
         self._dest_button: Optional[tk.Button] = None
@@ -188,8 +187,6 @@ class TranslationWindowManager:
             self._source_button.configure(text=self._source_button_text())
         if self._dest_button is not None:
             self._dest_button.configure(text=self._dest_button_text())
-        if self._header_label is not None:
-            self._header_label.configure(text=self._build_header_text(None))
 
     def _source_button_text(self) -> str:
         display = _language_display(self._source_language or "auto")
@@ -313,15 +310,6 @@ class TranslationWindowManager:
         )
         dest_button.pack(side=tk.LEFT, expand=True, fill=tk.X)
         self._dest_button = dest_button
-
-        header = tk.Label(
-            window,
-            text=self._build_header_text(None),
-            font=("Segoe UI", 12, "bold"),
-            wraplength=480,
-        )
-        header.pack(pady=(0, 5))
-        self._header_label = header
 
         original_label = tk.Label(window, text="Original", font=("Segoe UI", 10, "bold"))
         original_label.pack(anchor="w", padx=10)
@@ -487,7 +475,6 @@ class TranslationWindowManager:
             try:
                 while True:
                     original, translated, detected_source, reposition = self._queue.get_nowait()
-                    header.configure(text=self._build_header_text(detected_source))
                     original_box.configure(state=tk.NORMAL)
                     original_box.delete("1.0", tk.END)
                     original_box.insert(tk.END, original)
@@ -505,18 +492,9 @@ class TranslationWindowManager:
         apply_update()
         window.mainloop()
         self._window = None
-        self._header_label = None
         self._toggle_button = None
         self._source_button = None
         self._dest_button = None
-
-    def _build_header_text(self, detected_source: Optional[str]) -> str:
-        detected = detected_source or self._source_language or "auto"
-        detected_label = _language_display(detected)
-        dest_label = _language_display(self._dest_language)
-        if detected_source is None and self._source_language is None:
-            return f"翻訳先: {dest_label}"
-        return f"検出: {detected_label} → 翻訳先: {dest_label}"
 
 
 class SystemTrayController:
