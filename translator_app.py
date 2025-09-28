@@ -425,11 +425,32 @@ class TranslationWindowManager:
             """Adjust the text widget height based on its current content."""
 
             widget.update_idletasks()
-            try:
-                display_lines = widget.count("1.0", "end-1c", "displaylines")[0]
-            except tk.TclError:
-                text = widget.get("1.0", "end-1c")
-                display_lines = text.count("\n") + 1 if text else min_lines
+
+            end_index = widget.index("end-1c")
+            display_lines = 0
+
+            if widget.compare("1.0", "<=", end_index):
+                index = "1.0"
+                while widget.compare(index, "<=", end_index):
+                    try:
+                        if widget.dlineinfo(index) is None:
+                            break
+                    except tk.TclError:
+                        break
+                    display_lines += 1
+                    if widget.compare(index, "==", end_index):
+                        break
+                    next_index = widget.index(f"{index} +1displayline")
+                    if widget.compare(next_index, "==", index):
+                        break
+                    index = next_index
+
+            if display_lines == 0:
+                try:
+                    display_lines = widget.count("1.0", "end-1c", "displaylines")[0]
+                except tk.TclError:
+                    text = widget.get("1.0", "end-1c")
+                    display_lines = text.count("\n") + 1 if text else 0
 
             display_lines = max(min_lines, min(display_lines, max_lines))
             widget.configure(height=display_lines)
