@@ -94,6 +94,7 @@ class TranslationRequest:
     text: str
     src: Optional[str]
     dest: str
+    reposition: bool = True
 
 
 class TranslatorProtocol(Protocol):  # pragma: no cover - protocol is for type checking only
@@ -149,7 +150,7 @@ class TranslationWindowManager:
     ) -> None:
         self._source_language = source_language
         self._dest_language = dest_language
-        self._queue: "queue.Queue[tuple[str, str, Optional[str]]]" = queue.Queue()
+        self._queue: "queue.Queue[tuple[str, str, Optional[str], bool]]" = queue.Queue()
         self._ready = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._language_toggle_callback = language_toggle_callback
@@ -161,13 +162,20 @@ class TranslationWindowManager:
         self._source_button: Optional[tk.Button] = None
         self._dest_button: Optional[tk.Button] = None
 
-    def show(self, original: str, translated: str, detected_source: Optional[str]) -> None:
+    def show(
+        self,
+        original: str,
+        translated: str,
+        detected_source: Optional[str],
+        *,
+        reposition: bool = True,
+    ) -> None:
         if self._thread is None or not self._thread.is_alive():
             self._ready.clear()
             self._thread = threading.Thread(target=self._run_window, daemon=True)
             self._thread.start()
             self._ready.wait()
-        self._queue.put((original, translated, detected_source))
+        self._queue.put((original, translated, detected_source, reposition))
 
     def update_languages(self, source_language: Optional[str], dest_language: str) -> None:
         self._source_language = source_language
@@ -465,8 +473,9 @@ class TranslationWindowManager:
                 if attached:
                     user32.AttachThreadInput(foreground_thread_id, current_thread_id, False)
 
-        def bring_to_front() -> None:
-            place_near_pointer()
+        def bring_to_front(reposition: bool) -> None:
+            if reposition:
+                place_near_pointer()
             window.deiconify()
             window.lift()
             _force_foreground()
@@ -477,7 +486,7 @@ class TranslationWindowManager:
         def apply_update() -> None:
             try:
                 while True:
-                    original, translated, detected_source = self._queue.get_nowait()
+                    original, translated, detected_source, reposition = self._queue.get_nowait()
                     header.configure(text=self._build_header_text(detected_source))
                     original_box.configure(state=tk.NORMAL)
                     original_box.delete("1.0", tk.END)
@@ -487,7 +496,7 @@ class TranslationWindowManager:
                     translated_box.delete("1.0", tk.END)
                     translated_box.insert(tk.END, translated)
                     translated_box.configure(state=tk.DISABLED)
-                    bring_to_front()
+                    bring_to_front(reposition)
             except queue.Empty:
                 pass
             window.after(100, apply_update)
@@ -723,28 +732,51 @@ class CCTranslationApp:
         try:
             translation = self.translator.translate(request.text, src=request.src, dest=request.dest)
         except TranslationError as exc:  # pragma: no cover - network errors are runtime issues
-            self._render_translation(request.text, f"Error during translation: {exc}", request.src)
+            self._render_translation(
+                request,
+                f"Error during translation: {exc}",
+                request.src,
+            )
             return
 
         translated_text = getattr(translation, "text", str(translation))
         detected_source = getattr(translation, "detected_source", getattr(translation, "src", None))
-        self._render_translation(request.text, translated_text, detected_source)
+        self._render_translation(request, translated_text, detected_source)
 
-    def _render_translation(self, original: str, translated: str, detected_source: Optional[str]) -> None:
+    def _render_translation(
+        self,
+        request: TranslationRequest,
+        translated: str,
+        detected_source: Optional[str],
+    ) -> None:
         if self._display_callback is not None:
-            self._display_callback(original, translated, detected_source)
+            self._display_callback(request.text, translated, detected_source)
         else:
-            self._show_translation_window(original, translated, detected_source)
+            self._show_translation_window(
+                request.text,
+                translated,
+                detected_source,
+                reposition=request.reposition,
+            )
 
-    def _show_translation_window(self, original: str, translated: str, detected_source: Optional[str]) -> None:
-        self._window_manager.show(original, translated, detected_source)
+    def _show_translation_window(
+        self,
+        original: str,
+        translated: str,
+        detected_source: Optional[str],
+        *,
+        reposition: bool = True,
+    ) -> None:
+        self._window_manager.show(original, translated, detected_source, reposition=reposition)
 
     def _enqueue_retranslation(
         self, text: Optional[str], src: Optional[str], dest: Optional[str]
     ) -> None:
         if not text or not dest:
             return
-        self._request_queue.put(TranslationRequest(text=text, src=src, dest=dest))
+        self._request_queue.put(
+            TranslationRequest(text=text, src=src, dest=dest, reposition=False)
+        )
 
 
 def parse_args() -> argparse.Namespace:

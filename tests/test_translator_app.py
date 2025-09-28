@@ -116,6 +116,7 @@ class CCTranslationAppTests(unittest.TestCase):
         request = app._request_queue.get_nowait()
         self.assertEqual(request.text, "hello")
         self.assertEqual(request.dest, "ja")
+        self.assertTrue(request.reposition)
 
     def test_double_copy_resets_after_interval(self):
         app = self._create_app()
@@ -134,6 +135,7 @@ class CCTranslationAppTests(unittest.TestCase):
         self.assertEqual(request.text, "hello")
         self.assertIsNone(request.src)
         self.assertEqual(request.dest, "en")
+        self.assertFalse(request.reposition)
 
     def test_toggle_language_retranslates_last_text(self):
         app = self._create_app()
@@ -146,6 +148,7 @@ class CCTranslationAppTests(unittest.TestCase):
         self.assertEqual(request.text, "こんにちは")
         self.assertEqual(request.src, "ja")
         self.assertEqual(request.dest, "en")
+        self.assertFalse(request.reposition)
 
     def test_set_source_language_retranslates_last_text(self):
         app = self._create_app()
@@ -156,6 +159,7 @@ class CCTranslationAppTests(unittest.TestCase):
         self.assertEqual(request.text, "hello")
         self.assertEqual(request.src, "ja")
         self.assertEqual(request.dest, "en")
+        self.assertFalse(request.reposition)
 
     def test_process_single_request_uses_translator(self):
         translator = FakeTranslator(translated="translated", detected="en")
