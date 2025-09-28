@@ -565,7 +565,7 @@ class TranslationWindowManager:
 
 
 class SystemTrayController:
-    """Manage a Windows system tray icon with an Exit command."""
+    """Manage a Windows system tray icon with Reboot and Exit commands."""
 
     def __init__(self, app: "CCTranslationApp") -> None:
         self._app = app
@@ -593,7 +593,10 @@ class SystemTrayController:
         assert pystray is not None  # noqa: S101 - guarded by _is_supported
         image = self._create_icon_image()
         self._icon_image = image
-        menu = pystray.Menu(MenuItem("Exit", self._on_exit))
+        menu = pystray.Menu(
+            MenuItem("Reboot", self._on_reboot),
+            MenuItem("Exit", self._on_exit),
+        )
         self._icon = pystray.Icon("cctranslationtool", image, "CCTranslationTool", menu=menu)
         self._icon.run_detached()
 
@@ -605,6 +608,10 @@ class SystemTrayController:
 
     def _on_exit(self, icon: "pystray.Icon", _: MenuItem) -> None:
         self._app.stop()
+        icon.stop()
+
+    def _on_reboot(self, icon: "pystray.Icon", _: MenuItem) -> None:
+        self._app.reboot()
         icon.stop()
 
     def _create_icon_image(self) -> "Image.Image":

@@ -31,7 +31,7 @@ if "pystray" not in sys.modules:
     stub_pystray.MenuItem = _StubMenuItem
     sys.modules["pystray"] = stub_pystray
 
-from translator_app import CCTranslationApp, TranslationRequest
+from translator_app import CCTranslationApp, TranslationRequest, SystemTrayController
 from translation_service import TranslationError
 
 
@@ -334,6 +334,32 @@ class CCTranslationAppLifecycleTests(CCTranslationAppTestMixin, unittest.TestCas
         finally:
             app.stop()
             thread.join(timeout=1)
+
+
+class SystemTrayControllerTests(unittest.TestCase):
+    def test_reboot_menu_item_triggers_reboot_and_stops_icon(self) -> None:
+        class DummyApp:
+            def __init__(self) -> None:
+                self.reboot_called = False
+
+            def reboot(self) -> None:
+                self.reboot_called = True
+
+        class DummyIcon:
+            def __init__(self) -> None:
+                self.stopped = False
+
+            def stop(self) -> None:
+                self.stopped = True
+
+        dummy_app = DummyApp()
+        controller = SystemTrayController(dummy_app)
+        icon = DummyIcon()
+
+        controller._on_reboot(icon, None)
+
+        self.assertTrue(dummy_app.reboot_called)
+        self.assertTrue(icon.stopped)
 
 
 if __name__ == "__main__":
