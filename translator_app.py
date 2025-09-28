@@ -437,9 +437,6 @@ class TranslationWindowManager:
             hide_window()
             return "break"
 
-        close_button = tk.Button(window, text="Close", command=hide_window, font=button_font)
-        close_button.pack(pady=(0, 10))
-
         window.protocol("WM_DELETE_WINDOW", hide_window)
         window.bind("<Escape>", handle_escape)
 
