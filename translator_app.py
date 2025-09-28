@@ -25,7 +25,7 @@ except ImportError:  # pragma: no cover - handled in __init__
 
 try:
     import tkinter as tk
-    from tkinter import messagebox, scrolledtext
+    from tkinter import messagebox, scrolledtext, font as tkfont
 except ImportError as exc:  # pragma: no cover - tkinter is part of stdlib on Windows
     raise SystemExit("tkinter is required to display the translation window") from exc
 
@@ -263,10 +263,10 @@ class TranslationWindowManager:
         dest_label = _language_display(self._dest_language)
         return f"翻訳先: {dest_label}"
 
-    def _toggle_button_style(self, button: tk.Button) -> None:
+    def _toggle_button_style(self, button: tk.Button, font: tkfont.Font) -> None:
         button.configure(
             text="⇄",
-            font=("Segoe UI", 14, "bold"),
+            font=font,
             width=3,
             bg="#1a73e8",
             fg="white",
@@ -339,13 +339,40 @@ class TranslationWindowManager:
         window.geometry("500x400")
         window.withdraw()
 
+        default_font = tkfont.nametofont("TkDefaultFont")
+        preferred_families = (
+            "Google Sans",
+            "Roboto",
+            "Noto Sans JP",
+            "Noto Sans CJK JP",
+            "Noto Sans",
+            "Arial",
+            default_font.actual("family"),
+        )
+        available_families = {
+            name.lower(): name for name in tkfont.families()
+        }
+
+        def resolve_family(preferences: tuple[str, ...]) -> str:
+            for family in preferences:
+                key = family.lower()
+                if key in available_families:
+                    return available_families[key]
+            return default_font.actual("family")
+
+        base_family = resolve_family(preferred_families)
+        button_font = tkfont.Font(family=base_family, size=11)
+        toggle_font = tkfont.Font(family=base_family, size=14, weight="bold")
+        label_font = tkfont.Font(family=base_family, size=10, weight="bold")
+        text_font = tkfont.Font(family=base_family, size=12)
+
         controls_frame = tk.Frame(window, bg="#f8f9fa")
         controls_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
 
         source_button = tk.Button(
             controls_frame,
             text=self._source_button_text(),
-            font=("Segoe UI", 11),
+            font=button_font,
             relief=tk.SOLID,
             bd=1,
             bg="white",
@@ -360,14 +387,14 @@ class TranslationWindowManager:
             controls_frame,
             command=self._on_language_toggle,
         )
-        self._toggle_button_style(toggle_button)
+        self._toggle_button_style(toggle_button, toggle_font)
         toggle_button.pack(side=tk.LEFT, padx=8)
         self._toggle_button = toggle_button
 
         dest_button = tk.Button(
             controls_frame,
             text=self._dest_button_text(),
-            font=("Segoe UI", 11),
+            font=button_font,
             relief=tk.SOLID,
             bd=1,
             bg="white",
@@ -378,18 +405,18 @@ class TranslationWindowManager:
         dest_button.pack(side=tk.LEFT, expand=True, fill=tk.X)
         self._dest_button = dest_button
 
-        original_label = tk.Label(window, text="Original", font=("Segoe UI", 10, "bold"))
+        original_label = tk.Label(window, text="Original", font=label_font)
         original_label.pack(anchor="w", padx=10)
 
         original_box = scrolledtext.ScrolledText(window, wrap=tk.WORD, height=8)
-        original_box.configure(state=tk.DISABLED)
+        original_box.configure(state=tk.DISABLED, font=text_font)
         original_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
-        translated_label = tk.Label(window, text="Translated", font=("Segoe UI", 10, "bold"))
+        translated_label = tk.Label(window, text="Translated", font=label_font)
         translated_label.pack(anchor="w", padx=10)
 
         translated_box = scrolledtext.ScrolledText(window, wrap=tk.WORD, height=8)
-        translated_box.configure(state=tk.DISABLED)
+        translated_box.configure(state=tk.DISABLED, font=text_font)
         translated_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
         def hide_window() -> None:
@@ -401,7 +428,7 @@ class TranslationWindowManager:
             hide_window()
             return "break"
 
-        close_button = tk.Button(window, text="Close", command=hide_window)
+        close_button = tk.Button(window, text="Close", command=hide_window, font=button_font)
         close_button.pack(pady=(0, 10))
 
         window.protocol("WM_DELETE_WINDOW", hide_window)
