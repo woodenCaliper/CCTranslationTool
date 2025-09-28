@@ -419,16 +419,35 @@ class TranslationWindowManager:
         translated_box.configure(state=tk.DISABLED, font=text_font)
         translated_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
+        resize_job: Optional[str] = None
+
         def resize_text_widget(widget: tk.Text, *, min_lines: int = 1, max_lines: int = 15) -> None:
             """Adjust the text widget height based on its current content."""
 
+            widget.update_idletasks()
             try:
                 display_lines = widget.count("1.0", "end-1c", "displaylines")[0]
             except tk.TclError:
-                display_lines = int(float(widget.index("end-1c")))
+                text = widget.get("1.0", "end-1c")
+                display_lines = text.count("\n") + 1 if text else min_lines
 
             display_lines = max(min_lines, min(display_lines, max_lines))
             widget.configure(height=display_lines)
+
+        def schedule_resize(widget: tk.Text, *, min_lines: int = 1, max_lines: int = 15) -> None:
+            """Schedule a resize after idle to account for geometry updates."""
+
+            nonlocal resize_job
+
+            if resize_job is not None:
+                window.after_cancel(resize_job)
+
+            def _apply_resize() -> None:
+                nonlocal resize_job
+                resize_job = None
+                resize_text_widget(widget, min_lines=min_lines, max_lines=max_lines)
+
+            resize_job = window.after_idle(_apply_resize)
 
         def hide_window() -> None:
             window.withdraw()
@@ -583,8 +602,8 @@ class TranslationWindowManager:
                     original_box.configure(state=tk.NORMAL)
                     original_box.delete("1.0", tk.END)
                     original_box.insert(tk.END, original)
-                    resize_text_widget(original_box)
                     original_box.configure(state=tk.DISABLED)
+                    schedule_resize(original_box)
                     translated_box.configure(state=tk.NORMAL)
                     translated_box.delete("1.0", tk.END)
                     translated_box.insert(tk.END, translated)
