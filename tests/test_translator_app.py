@@ -1,5 +1,6 @@
 import io
 import queue
+import threading
 import sys
 import types
 import unittest
@@ -226,6 +227,48 @@ class CCTranslationAppTests(unittest.TestCase):
 
         request = app._request_queue.get_nowait()
         self.assertEqual(request.text, "hello")
+
+    def test_translate_is_safe_during_reboot(self):
+        translator = FakeTranslator(translated="こんにちは", detected="en")
+        factory_started = threading.Event()
+        allow_factory_to_finish = threading.Event()
+        exceptions = []
+
+        def blocking_factory() -> FakeTranslator:
+            factory_started.set()
+            allow_factory_to_finish.wait(timeout=1)
+            return translator
+
+        app = self._create_app(translator_factory=blocking_factory)
+
+        def worker() -> None:
+            try:
+                app._process_single_request(TranslationRequest(text="hello", src=None, dest="ja"))
+            except Exception as exc:  # pragma: no cover - failure captured in assertions
+                exceptions.append(exc)
+
+        worker_thread = threading.Thread(target=worker)
+        worker_thread.start()
+
+        self.assertTrue(factory_started.wait(timeout=1), "translator_factory was not invoked")
+
+        reboot_thread = threading.Thread(target=app.reboot)
+        reboot_thread.start()
+        reboot_thread.join(0.01)
+        self.assertTrue(
+            reboot_thread.is_alive(),
+            "reboot() should wait until translator initialization has finished",
+        )
+
+        allow_factory_to_finish.set()
+
+        worker_thread.join()
+        reboot_thread.join()
+
+        if exceptions:
+            raise exceptions[0]
+
+        self.assertEqual(translator.calls, [("hello", None, "ja")])
 
 
 if __name__ == "__main__":

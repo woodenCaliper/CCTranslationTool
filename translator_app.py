@@ -579,6 +579,7 @@ class CCTranslationApp:
         self.source_language = source_language
         self._translator: Optional[TranslatorProtocol] = None
         self._translator_factory = translator_factory
+        self._translator_lock = threading.Lock()
         self._copy_detector = DoubleCopyDetector(double_copy_interval, time_provider)
         self._lock = threading.Lock()
         self._request_queue: "queue.Queue[TranslationRequest]" = queue.Queue()
@@ -607,9 +608,16 @@ class CCTranslationApp:
 
     @property
     def translator(self) -> TranslatorProtocol:
-        if self._translator is None:
-            self._translator = self._translator_factory()
-        return self._translator
+        with self._translator_lock:
+            if self._translator is None:
+                self._translator = self._translator_factory()
+            translator = self._translator
+        assert translator is not None  # For type checkers
+        return translator
+
+    def reboot(self) -> None:
+        with self._translator_lock:
+            self._translator = None
 
     def start(self, *, tray_controller: Optional[SystemTrayController] = None) -> None:
         """Start listening for keyboard events and processing translations."""
