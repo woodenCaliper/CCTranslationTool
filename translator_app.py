@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import queue
 import threading
 import time
@@ -426,33 +427,41 @@ class TranslationWindowManager:
 
             widget.update_idletasks()
 
-            end_index = widget.index("end-1c")
-            display_lines = 0
+            text = widget.get("1.0", "end-1c")
 
-            if widget.compare("1.0", "<=", end_index):
-                index = "1.0"
-                while widget.compare(index, "<=", end_index):
-                    try:
-                        if widget.dlineinfo(index) is None:
-                            break
-                    except tk.TclError:
-                        break
-                    display_lines += 1
-                    if widget.compare(index, "==", end_index):
-                        break
-                    next_index = widget.index(f"{index} +1displayline")
-                    if widget.compare(next_index, "==", index):
-                        break
-                    index = next_index
+            # Step 1: count the characters to translate.
+            char_count = len(text)
+            if char_count == 0:
+                widget.configure(height=min_lines)
+                return
 
-            if display_lines == 0:
-                try:
-                    display_lines = widget.count("1.0", "end-1c", "displaylines")[0]
-                except tk.TclError:
-                    text = widget.get("1.0", "end-1c")
-                    display_lines = text.count("\n") + 1 if text else 0
+            # Step 2: estimate how many characters fit on one line using the
+            # current window width and the active font metrics.
+            window = widget.winfo_toplevel()
+            window_width = window.winfo_width()
+            if window_width <= 1:
+                window_width = window.winfo_reqwidth()
 
-            display_lines = max(min_lines, min(display_lines, max_lines))
+            font = tkfont.Font(font=widget.cget("font"))
+            # Measure a representative wide character and fall back to 1px.
+            sample_width = max(font.measure("W"), font.measure("あ"), 1)
+
+            if window_width <= 1 or sample_width <= 0:
+                widget.configure(height=min_lines)
+                return
+
+            chars_per_line = max(window_width // sample_width, 1)
+
+            # Step 3: compute the number of lines needed and apply the result.
+            lines_needed = 0
+            for segment in text.split("\n"):
+                segment_length = len(segment)
+                if segment_length == 0:
+                    lines_needed += 1
+                    continue
+                lines_needed += math.ceil(segment_length / chars_per_line)
+
+            display_lines = max(min_lines, min(lines_needed, max_lines))
             widget.configure(height=display_lines)
 
         def schedule_resize(widget: tk.Text, *, min_lines: int = 1, max_lines: int = 15) -> None:
