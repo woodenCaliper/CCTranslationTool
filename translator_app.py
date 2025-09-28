@@ -684,7 +684,7 @@ class CCTranslationApp:
         assert translator is not None  # For type checkers
         return translator
 
-    def reboot(self) -> None:
+    def _reset_translator(self) -> None:
         with self._translator_lock:
             self._translator = None
 
@@ -729,8 +729,9 @@ class CCTranslationApp:
         self._stop_event.set()
 
     def reboot(self) -> None:
-        """Restart the application loop by reinitialising keyboard listeners."""
+        """Restart the application loop and reset cached translator state."""
 
+        self._reset_translator()
         self._restart_event.set()
         self._stop_event.set()
 
