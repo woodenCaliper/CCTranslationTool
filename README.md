@@ -62,7 +62,7 @@ python -m unittest discover
 
 ## Windows 用実行ファイルのビルド
 
-`packaging/build_executable.py` は PyInstaller を利用して単一の `.exe` ファイルを生成するスクリプトです。Windows 環境で以下の手順を実行してください。
+`packaging/build_executable.py` は PyInstaller を利用して Windows 向け実行ファイルを生成するスクリプトです。デフォルトでは PyInstaller の `onedir` モードを採用し、生成されたフォルダーをそのまま配布することで Windows Defender が `Program:Script/Wacapew.A!ml` として誤検知する問題 (PyInstaller の単一ファイルブートストラップに対する既知のヒューリスティック) を回避しています。Windows 環境で以下の手順を実行してください。
 
 1. 依存関係に加えて PyInstaller をインストールします。
 
@@ -76,7 +76,13 @@ python -m unittest discover
    python packaging/build_executable.py
    ```
 
-   生成された `CCTranslationTool.exe` は `package/` ディレクトリに配置され、PyInstaller が生成した一時ディレクトリや `.spec` ファイルは自動的に削除されます。
+   `package/CCTranslationTool/` フォルダーに必要な DLL を含む実行ファイル一式が配置されます。`CCTranslationTool.exe` を実行する際はこのフォルダー内から起動してください。PyInstaller が生成した一時ディレクトリや `.spec` ファイルは自動的に削除されます。
+
+   既存のワークフローで単一の `.exe` ファイルが必要な場合は、以下のように `--mode onefile` を指定してください。ただし、このモードは前述のヒューリスティック検出を受けやすい点に留意してください。
+
+   ```bash
+   python packaging/build_executable.py --mode onefile
+   ```
 
 ## トラブルシューティング
 
