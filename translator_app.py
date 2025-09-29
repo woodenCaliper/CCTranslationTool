@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import queue
 import threading
 import time
@@ -46,6 +47,9 @@ import sys
 import tempfile
 
 from translation_service import GoogleTranslateClient, TranslationError, TranslationResult
+
+
+logger = logging.getLogger(__name__)
 
 
 DOUBLE_COPY_INTERVAL = 0.5  # Seconds allowed between two copy events.
@@ -110,8 +114,9 @@ class DoubleCopyDetector:
 
     interval: float
     now: Callable[[], float]
-    _last_time: float = field(default=0.0, init=False)
+    _last_time: Optional[float] = field(default=None, init=False)
     _count: int = field(default=0, init=False)
+    _last_interval: float = field(default=0.0, init=False)
 
     def register(self) -> bool:
         """Register a copy event.
@@ -119,8 +124,12 @@ class DoubleCopyDetector:
         Returns ``True`` if the event completes a "double copy" sequence.
         """
 
+        previous_time = self._last_time
         current = self.now()
-        if current - self._last_time <= self.interval:
+        interval_since_last = current - previous_time if previous_time is not None else float("inf")
+        self._last_interval = interval_since_last
+
+        if previous_time is not None and interval_since_last <= self.interval:
             self._count += 1
         else:
             self._count = 1
@@ -134,8 +143,21 @@ class DoubleCopyDetector:
     def reset(self) -> None:
         """Reset the detector state so future copies restart the sequence."""
 
-        self._last_time = 0.0
+        self._last_time = None
         self._count = 0
+        self._last_interval = 0.0
+
+    @property
+    def pending_count(self) -> int:
+        """Return the current number of consecutive copy events."""
+
+        return self._count
+
+    @property
+    def last_interval(self) -> float:
+        """Return the time elapsed since the previous copy event."""
+
+        return self._last_interval
 
 
 class SingleInstanceError(RuntimeError):
@@ -734,14 +756,24 @@ class CCTranslationApp:
         self._tray_controller = tray_controller
 
         if self._worker_thread is None or not self._worker_thread.is_alive():
-            self._worker_thread = threading.Thread(target=self._process_requests, daemon=True)
+            self._worker_thread = threading.Thread(
+                target=self._process_requests,
+                name="TranslationWorker",
+                daemon=True,
+            )
             self._worker_thread.start()
+            logger.info("Started worker thread %s", self._worker_thread.name)
+        else:
+            logger.info(
+                "Worker thread already running (alive=%s)",
+                self._worker_thread.is_alive(),
+            )
 
         while True:
             self._keyboard.add_hotkey("ctrl+c", self._handle_copy_event, suppress=False)
 
-            print(
-                "CCTranslationTool is running. Double press Ctrl+C on selected text to translate."
+            logger.info(
+                "CCTranslationTool is running. Double press Ctrl+C on selected text to translate.",
             )
             if self._tray_controller is not None:
                 self._tray_controller.start()
@@ -816,7 +848,16 @@ class CCTranslationApp:
 
     def _handle_copy_event(self) -> None:
         with self._lock:
-            if self._copy_detector.register():
+            double_copy = self._copy_detector.register()
+            current_count = 2 if double_copy else self._copy_detector.pending_count
+            logger.info(
+                "Copy event handled (double=%s, count=%d, interval=%.3f, worker_alive=%s)",
+                double_copy,
+                current_count,
+                self._copy_detector.last_interval,
+                self._worker_thread.is_alive() if self._worker_thread else False,
+            )
+            if double_copy:
                 try:
                     text = self._clipboard.paste()
                 except Exception as exc:  # pragma: no cover - exercised via unit tests
@@ -824,6 +865,7 @@ class CCTranslationApp:
                         message = f"Failed to read clipboard: {exc}"
                     else:
                         message = f"Unexpected error while accessing clipboard: {exc}"
+                    logger.warning(message)
                     print(message)
                     self._copy_detector.reset()
                     return
@@ -832,12 +874,19 @@ class CCTranslationApp:
                     self._request_queue.put(
                         TranslationRequest(text=text, src=self.source_language, dest=self.dest_language)
                     )
+                    logger.info(
+                        "Enqueued translation request (length=%d, queue_size=%d)",
+                        len(text),
+                        self._request_queue.qsize(),
+                    )
 
     def _process_requests(self) -> None:
         while True:
             request = self._request_queue.get()
             try:
                 self._process_single_request(request)
+            except Exception:
+                logger.exception("Unhandled error while processing request: %s", request)
             finally:
                 self._request_queue.task_done()
 
@@ -910,6 +959,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
     try:
         with SingleInstanceGuard("cctranslationtool"):
             args = parse_args()
