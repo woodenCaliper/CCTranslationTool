@@ -162,13 +162,20 @@ class RegisterHotKeyService(BaseHotkeyService):
 
         message_map = {
             self._win32con.WM_HOTKEY: self._on_hotkey,
-            self._win32con.WM_INPUTLANGCHANGE: self._on_language_change,
-            self._win32con.WM_POWERBROADCAST: self._on_power_broadcast,
-            self._win32con.WM_WTSSESSION_CHANGE: self._on_session_change,
             self._WM_APP_REREGISTER: self._on_reregister_request,
             self._win32con.WM_CLOSE: self._on_close,
             self._win32con.WM_DESTROY: self._on_destroy,
         }
+
+        input_lang_change = getattr(self._win32con, "WM_INPUTLANGCHANGE", 0x0051)
+        message_map[input_lang_change] = self._on_language_change
+
+        power_broadcast = getattr(self._win32con, "WM_POWERBROADCAST", 0x0218)
+        message_map[power_broadcast] = self._on_power_broadcast
+
+        session_change = getattr(self._win32con, "WM_WTSSESSION_CHANGE", 0x02B1)
+        if self._win32ts is not None:
+            message_map[session_change] = self._on_session_change
 
         wndclass = self._win32gui.WNDCLASS()
         wndclass.hInstance = hinstance
