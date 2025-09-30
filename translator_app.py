@@ -13,10 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import IO, Callable, Optional, Protocol
 
-try:  # pragma: no cover - executed during module import
-    import keyboard  # type: ignore
-except ImportError:  # pragma: no cover - handled in __init__
-    keyboard = None  # type: ignore
+from keyboard_adapter import create_keyboard_listener
 
 try:  # pragma: no cover - executed during module import
     import pyperclip  # type: ignore
@@ -676,7 +673,7 @@ class CCTranslationApp:
         source_language: Optional[str] = None,
         *,
         translator_factory: Callable[[], TranslatorProtocol] = GoogleTranslateClient,
-        keyboard_module=keyboard,
+        keyboard_module=None,
         clipboard_module=pyperclip,
         time_provider: Callable[[], float] = time.time,
         display_callback: Optional[Callable[[str, str, Optional[str]], None]] = None,
@@ -694,8 +691,10 @@ class CCTranslationApp:
         self._restart_event = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
         if keyboard_module is None:
+            keyboard_module = create_keyboard_listener()
+        if keyboard_module is None:
             raise RuntimeError(
-                "The 'keyboard' package is required. Install it with 'pip install keyboard'."
+                "The 'pyWinhook' package is required. Install it with 'pip install pyWinhook'."
             )
         if clipboard_module is None:
             raise RuntimeError(
