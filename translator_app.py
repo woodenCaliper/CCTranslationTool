@@ -9,6 +9,7 @@ import logging
 import queue
 import threading
 import time
+import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -63,6 +64,32 @@ LANGUAGE_DISPLAY_NAMES = {
     "auto": "自動検出",
     None: "自動検出",
 }
+
+TROUBLESHOOTING_GUIDE = textwrap.dedent(
+    """
+    ================================
+    CCTranslationTool トラブルシューティング手順
+    ================================
+
+    1. 再現したら Ctrl+Shift+H（ハートビート）と Ctrl+Shift+D（診断ダンプ）を押し、
+       ログにワーカー・キュー・リスナーの状態を残してください。
+    2. `--debug-key-events` フラグ付きで起動し、Ctrl+Shift+E を押して最新のキーイベント統計を記録するとホットキー層の停止を切り分けられます。
+    3. `Keyboard permission status` の 10 秒ごとの出力で `pending_copy`・`listener_state`・`last_copy_age` を追跡し、値が変化しなくなったタイミングを控えてください。
+    4. 低レベルのキーイベントが届いているかを確認するため、別ターミナルで `python keyboard_hook_probe.py --log keyboard_events.log` を実行し、問題発生時に Ctrl+C が記録されるかを比較してください。
+    5. 取得したログと再現手順（直前に押したキー、表示されたメッセージ）を添えて報告していただけると原因特定が進みます。
+    """
+)
+
+
+def print_troubleshooting_guide(stream: Optional[IO[str]] = None) -> None:
+    """Output recommended investigation steps for stalled hotkeys."""
+
+    if stream is None:
+        stream = sys.stdout
+    stream.write(TROUBLESHOOTING_GUIDE)
+    if not TROUBLESHOOTING_GUIDE.endswith("\n"):
+        stream.write("\n")
+    stream.flush()
 
 
 def _load_saved_dest_language(default: str = "ja") -> str:
@@ -1076,6 +1103,9 @@ class CCTranslationApp:
             logger.info(
                 "CCTranslationTool is running. Double press Ctrl+C on selected text to translate.",
             )
+            logger.info(
+                "トラブルが発生したら Ctrl+Shift+H / Ctrl+Shift+D / Ctrl+Shift+E でログを取得し、詳細手順は '--show-debug-guide' で確認してください。"
+            )
             if self._tray_controller is not None:
                 self._tray_controller.start()
 
@@ -1369,6 +1399,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Log recent Ctrl/C key event timings seen by the keyboard hook.",
     )
+    parser.add_argument(
+        "--show-debug-guide",
+        action="store_true",
+        help="Print recommended troubleshooting steps and exit.",
+    )
     return parser.parse_args()
 
 
@@ -1377,9 +1412,12 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    args = parse_args()
+    if getattr(args, "show_debug_guide", False):
+        print_troubleshooting_guide()
+        return
     try:
         with SingleInstanceGuard("cctranslationtool"):
-            args = parse_args()
             _save_dest_language(args.dest)
             app = CCTranslationApp(
                 dest_language=args.dest,

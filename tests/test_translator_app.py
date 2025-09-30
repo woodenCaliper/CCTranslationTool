@@ -32,7 +32,13 @@ if "pystray" not in sys.modules:
     stub_pystray.MenuItem = _StubMenuItem
     sys.modules["pystray"] = stub_pystray
 
-from translator_app import CCTranslationApp, TranslationRequest, SystemTrayController
+from translator_app import (
+    CCTranslationApp,
+    TranslationRequest,
+    SystemTrayController,
+    parse_args,
+    print_troubleshooting_guide,
+)
 from translation_service import TranslationError
 
 
@@ -482,6 +488,24 @@ class SystemTrayControllerTests(unittest.TestCase):
 
         self.assertTrue(dummy_app.reboot_called)
         self.assertTrue(icon.stopped)
+
+
+class TroubleshootingGuideTests(unittest.TestCase):
+    def test_troubleshooting_guide_prints_expected_keywords(self) -> None:
+        buffer = io.StringIO()
+        print_troubleshooting_guide(buffer)
+        output = buffer.getvalue()
+        self.assertIn("Ctrl+Shift+H", output)
+        self.assertIn("keyboard_hook_probe.py", output)
+
+    def test_parse_args_exposes_show_debug_guide_flag(self) -> None:
+        original = sys.argv[:]
+        try:
+            sys.argv = ["translator_app.py", "--show-debug-guide"]
+            args = parse_args()
+        finally:
+            sys.argv = original
+        self.assertTrue(args.show_debug_guide)
 
 
 if __name__ == "__main__":
