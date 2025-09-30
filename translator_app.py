@@ -159,6 +159,12 @@ class DoubleCopyDetector:
 
         return self._last_interval
 
+    @property
+    def last_event_time(self) -> Optional[float]:
+        """Return the timestamp of the most recent copy event, if known."""
+
+        return self._last_time
+
 
 class SingleInstanceError(RuntimeError):
     """Raised when another instance of the application is already running."""
@@ -709,6 +715,7 @@ class CCTranslationApp:
         self._translator: Optional[TranslatorProtocol] = None
         self._translator_factory = translator_factory
         self._translator_lock = threading.Lock()
+        self._time_provider = time_provider
         self._copy_detector = DoubleCopyDetector(double_copy_interval, time_provider)
         self._lock = threading.Lock()
         self._request_queue: "queue.Queue[TranslationRequest]" = queue.Queue()
@@ -737,6 +744,12 @@ class CCTranslationApp:
         self._language_options = list(LANGUAGE_SEQUENCE)
         self._last_original_text: Optional[str] = None
         self._hotkey_handles: dict[str, int] = {}
+        self._hotkey_lock = threading.Lock()
+        self._hotkeys_active = threading.Event()
+        self._monitor_stop_event = threading.Event()
+        self._keyboard_monitor_thread: Optional[threading.Thread] = None
+        self._last_copy_timestamp: float = 0.0
+        self._last_keyboard_listener_state: Optional[bool] = None
 
     @property
     def translator(self) -> TranslatorProtocol:
@@ -750,6 +763,90 @@ class CCTranslationApp:
     def _reset_translator(self) -> None:
         with self._translator_lock:
             self._translator = None
+
+    def _register_hotkeys(self, *, force: bool = False) -> None:
+        with self._hotkey_lock:
+            if not force and self._hotkey_handles:
+                return
+            self._remove_hotkeys_locked()
+            self._hotkey_handles["copy"] = self._keyboard.add_hotkey(
+                "ctrl+c", self._handle_copy_event, suppress=False
+            )
+            self._hotkey_handles["heartbeat"] = self._keyboard.add_hotkey(
+                "ctrl+shift+h", self._log_hotkey_heartbeat, suppress=False
+            )
+            self._hotkey_handles["diagnostics"] = self._keyboard.add_hotkey(
+                "ctrl+shift+d", self._dump_diagnostics, suppress=False
+            )
+            self._hotkeys_active.set()
+
+    def _remove_hotkeys(self) -> None:
+        with self._hotkey_lock:
+            self._remove_hotkeys_locked()
+
+    def _remove_hotkeys_locked(self) -> None:
+        if hasattr(self._keyboard, "remove_hotkey"):
+            for handle in list(self._hotkey_handles.values()):
+                with contextlib.suppress(KeyError):
+                    self._keyboard.remove_hotkey(handle)
+        self._hotkey_handles.clear()
+        self._hotkeys_active.clear()
+
+    def _get_keyboard_listener_state(self) -> Optional[bool]:
+        listener = getattr(self._keyboard, "_listener", None)
+        listening = getattr(listener, "listening", None)
+        if isinstance(listening, bool):
+            self._last_keyboard_listener_state = listening
+            return listening
+        return None
+
+    def _start_keyboard_monitor(self) -> None:
+        if self._keyboard_monitor_thread and self._keyboard_monitor_thread.is_alive():
+            return
+        self._monitor_stop_event.clear()
+        thread = threading.Thread(
+            target=self._monitor_keyboard_listener,
+            name="KeyboardMonitor",
+            daemon=True,
+        )
+        self._keyboard_monitor_thread = thread
+        thread.start()
+
+    def _stop_keyboard_monitor(self) -> None:
+        self._monitor_stop_event.set()
+        thread = self._keyboard_monitor_thread
+        if thread is not None:
+            thread.join(timeout=1.0)
+        self._keyboard_monitor_thread = None
+
+    def _monitor_keyboard_listener(self) -> None:
+        failure_count = 0
+        while not self._monitor_stop_event.wait(5.0):
+            failure_count = self._check_keyboard_listener(failure_count)
+
+    def _check_keyboard_listener(self, failure_count: int) -> int:
+        if not self._hotkeys_active.is_set():
+            return 0
+        state = self._get_keyboard_listener_state()
+        if state is None:
+            return 0
+        if state:
+            return 0
+        failure_count += 1
+        logger.warning(
+            "Keyboard listener inactive (attempt=%d); requesting restart", failure_count
+        )
+        listener = getattr(self._keyboard, "_listener", None)
+        restart = getattr(listener, "start_if_necessary", None)
+        if callable(restart):
+            try:
+                restart()
+            except Exception:
+                logger.exception("Failed to restart keyboard listener")
+            else:
+                logger.info("Keyboard listener restart requested")
+        self._register_hotkeys(force=True)
+        return failure_count
 
     def start(self, *, tray_controller: Optional[SystemTrayController] = None) -> None:
         """Start listening for keyboard events and processing translations."""
@@ -771,15 +868,8 @@ class CCTranslationApp:
             )
 
         while True:
-            self._hotkey_handles["copy"] = self._keyboard.add_hotkey(
-                "ctrl+c", self._handle_copy_event, suppress=False
-            )
-            self._hotkey_handles["heartbeat"] = self._keyboard.add_hotkey(
-                "ctrl+shift+h", self._log_hotkey_heartbeat, suppress=False
-            )
-            self._hotkey_handles["diagnostics"] = self._keyboard.add_hotkey(
-                "ctrl+shift+d", self._dump_diagnostics, suppress=False
-            )
+            self._start_keyboard_monitor()
+            self._register_hotkeys(force=True)
 
             logger.info(
                 "CCTranslationTool is running. Double press Ctrl+C on selected text to translate.",
@@ -792,14 +882,11 @@ class CCTranslationApp:
             except KeyboardInterrupt:  # pragma: no cover - manual console interruption
                 self.stop()
             finally:
-                self._keyboard.unhook_all()
+                self._remove_hotkeys()
+                if hasattr(self._keyboard, "unhook_all"):
+                    self._keyboard.unhook_all()
                 if self._tray_controller is not None:
                     self._tray_controller.stop()
-                if hasattr(self._keyboard, "remove_hotkey"):
-                    for handle in self._hotkey_handles.values():
-                        with contextlib.suppress(KeyError):
-                            self._keyboard.remove_hotkey(handle)
-                self._hotkey_handles.clear()
 
             if self._restart_event.is_set():
                 self._restart_event.clear()
@@ -808,11 +895,15 @@ class CCTranslationApp:
 
             break
 
+        self._stop_keyboard_monitor()
+
     def stop(self) -> None:
         """Signal the application to shut down."""
 
         self._restart_event.clear()
         self._stop_event.set()
+        self._monitor_stop_event.set()
+        self._hotkeys_active.clear()
 
     def reboot(self) -> None:
         """Restart the application loop and reset cached translator state."""
@@ -866,6 +957,11 @@ class CCTranslationApp:
             double_copy = self._copy_detector.register()
             current_count = 2 if double_copy else self._copy_detector.pending_count
             last_interval = self._copy_detector.last_interval
+            last_event_time = self._copy_detector.last_event_time
+            if last_event_time is not None:
+                self._last_copy_timestamp = last_event_time
+            else:
+                self._last_copy_timestamp = self._time_provider()
         logger.info(
             "Copy event handled (double=%s, count=%d, interval=%.3f, worker_alive=%s)",
             double_copy,
@@ -977,12 +1073,27 @@ class CCTranslationApp:
         with self._lock:
             pending_copy = self._copy_detector.pending_count
             last_interval = self._copy_detector.last_interval
+            last_copy_timestamp = self._last_copy_timestamp
+        listener_state = self._get_keyboard_listener_state()
+        monitor_alive = (
+            self._keyboard_monitor_thread.is_alive()
+            if self._keyboard_monitor_thread
+            else False
+        )
+        last_copy_age = (
+            self._time_provider() - last_copy_timestamp
+            if last_copy_timestamp
+            else None
+        )
         logger.info(
-            "Hotkey heartbeat triggered (worker_alive=%s, queue_size=%d, pending_copy=%d, interval=%.3f)",
+            "Hotkey heartbeat triggered (worker_alive=%s, queue_size=%d, pending_copy=%d, interval=%.3f, listener_active=%s, monitor_alive=%s, last_copy_age=%s)",
             worker_alive,
             queue_size,
             pending_copy,
             last_interval,
+            listener_state,
+            monitor_alive,
+            None if last_copy_age is None else f"{last_copy_age:.3f}",
         )
 
     def _dump_diagnostics(self) -> None:
@@ -994,14 +1105,30 @@ class CCTranslationApp:
         with self._lock:
             pending_copy = self._copy_detector.pending_count
             last_interval = self._copy_detector.last_interval
+            last_copy_timestamp = self._last_copy_timestamp
+        listener_state = self._get_keyboard_listener_state()
+        monitor_alive = (
+            self._keyboard_monitor_thread.is_alive()
+            if self._keyboard_monitor_thread
+            else False
+        )
+        last_copy_age = (
+            self._time_provider() - last_copy_timestamp
+            if last_copy_timestamp
+            else None
+        )
         logger.info(
-            "Diagnostics dump: worker_alive=%s, queue_size=%d, pending_copy=%d, interval=%.3f, restart=%s, stop=%s, threads=[%s]",
+            "Diagnostics dump: worker_alive=%s, queue_size=%d, pending_copy=%d, interval=%.3f, restart=%s, stop=%s, listener_active=%s, monitor_alive=%s, hotkeys_active=%s, last_copy_age=%s, threads=[%s]",
             worker_alive,
             queue_size,
             pending_copy,
             last_interval,
             self._restart_event.is_set(),
             self._stop_event.is_set(),
+            listener_state,
+            monitor_alive,
+            self._hotkeys_active.is_set(),
+            None if last_copy_age is None else f"{last_copy_age:.3f}",
             threads,
         )
 

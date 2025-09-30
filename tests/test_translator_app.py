@@ -55,12 +55,33 @@ class FakeClipboard:
 
 
 class FakeKeyboard:
+    class Listener:
+        def __init__(self) -> None:
+            self.listening = True
+            self.start_calls = 0
+
+        def start_if_necessary(self) -> None:
+            self.start_calls += 1
+            self.listening = True
+
     def __init__(self) -> None:
         self.registered = []
+        self._handles: dict[int, tuple[tuple, dict]] = {}
         self.unhooked = False
+        self.removed: list[int] = []
+        self._next_handle = 1
+        self._listener = FakeKeyboard.Listener()
 
     def add_hotkey(self, *args, **kwargs):  # pragma: no cover - only used in manual runs
+        handle = self._next_handle
+        self._next_handle += 1
         self.registered.append((args, kwargs))
+        self._handles[handle] = (args, kwargs)
+        return handle
+
+    def remove_hotkey(self, handle: int) -> None:  # pragma: no cover - only used in manual runs
+        self._handles.pop(handle, None)
+        self.removed.append(handle)
 
     def wait(self):  # pragma: no cover - only used in manual runs
         raise RuntimeError("wait should not be called during tests")
@@ -198,6 +219,31 @@ class CCTranslationAppTests(CCTranslationAppTestMixin, unittest.TestCase):
         self.assertFalse(app._stop_event.is_set())
         app.stop()
         self.assertTrue(app._stop_event.is_set())
+
+    def test_handle_copy_event_updates_last_copy_timestamp(self):
+        fake_time = FakeTime()
+        app = self._create_app(fake_time=fake_time)
+        self.assertEqual(app._last_copy_timestamp, 0.0)
+        app._handle_copy_event()
+        self.assertEqual(app._last_copy_timestamp, fake_time.now())
+
+    def test_keyboard_monitor_attempts_restart_when_listener_inactive(self):
+        app = self._create_app()
+        app._register_hotkeys(force=True)
+        app._keyboard._listener.listening = False
+        with mock.patch.object(app, "_register_hotkeys") as register_mock:
+            register_mock.side_effect = lambda force=False: None
+            failures = app._check_keyboard_listener(0)
+        self.assertEqual(failures, 1)
+        self.assertEqual(app._keyboard._listener.start_calls, 1)
+        register_mock.assert_called_once_with(force=True)
+
+    def test_keyboard_monitor_noop_when_hotkeys_inactive(self):
+        app = self._create_app()
+        app._hotkeys_active.clear()
+        failures = app._check_keyboard_listener(2)
+        self.assertEqual(failures, 0)
+        self.assertEqual(app._keyboard._listener.start_calls, 0)
 
     def test_clipboard_error_does_not_enqueue_and_recovers(self):
         class LockedClipboard(FakeClipboard):
