@@ -58,15 +58,29 @@ class FakeKeyboard:
     def __init__(self) -> None:
         self.registered = []
         self.unhooked = False
+        self.removed = []
+        self.hooks = []
 
     def add_hotkey(self, *args, **kwargs):  # pragma: no cover - only used in manual runs
         self.registered.append((args, kwargs))
+        return f"hotkey-{len(self.registered)}"
+
+    def remove_hotkey(self, handle):  # pragma: no cover - only used in manual runs
+        self.removed.append(handle)
+
+    def hook(self, callback):  # pragma: no cover - only used in manual runs
+        self.hooks.append(callback)
+        return callback
+
+    def unhook(self, callback):  # pragma: no cover - only used in manual runs
+        self.hooks = [hook for hook in self.hooks if hook is not callback]
 
     def wait(self):  # pragma: no cover - only used in manual runs
         raise RuntimeError("wait should not be called during tests")
 
     def unhook_all(self):  # pragma: no cover - only used in manual runs
         self.unhooked = True
+        self.hooks.clear()
 
 
 class FakeTranslator:
@@ -83,6 +97,17 @@ class FakeTranslator:
 class ErroringTranslator:
     def translate(self, text: str, src=None, dest=None):
         raise TranslationError("boom")
+
+
+class RecordingKeyboard(FakeKeyboard):
+    def __init__(self) -> None:
+        super().__init__()
+        self.events = []
+
+    def emit(self, event: SimpleNamespace) -> None:
+        self.events.append(event)
+        for hook in list(self.hooks):
+            hook(event)
 
 
 class CCTranslationAppTestMixin:
@@ -192,6 +217,29 @@ class CCTranslationAppTests(CCTranslationAppTestMixin, unittest.TestCase):
         self.assertEqual(captured[0][0], "hello")
         self.assertIn("Error during translation", captured[0][1])
         self.assertEqual(captured[0][2], "en")
+
+    def test_ime_toggle_fallback_registered_even_when_ime_hotkey_succeeds(self):
+        keyboard = RecordingKeyboard()
+        app = self._create_app(keyboard_module=keyboard)
+
+        with mock.patch.object(
+            app, "_refresh_copy_hotkey", wraps=app._refresh_copy_hotkey
+        ) as refresh_mock:
+            app._altgr_pressed = True
+            app._register_ime_toggle_workaround()
+
+            ime_hotkeys = [args for args, _ in keyboard.registered if args and args[0] == "ime kanji mode"]
+            self.assertGreaterEqual(
+                len(ime_hotkeys), 1, "IME hotkey should be registered even when fallback exists"
+            )
+            self.assertGreaterEqual(len(keyboard.hooks), 1, "Fallback hook must always be added")
+            self.assertIsNotNone(app._ime_fallback_hook)
+
+            event = SimpleNamespace(name="半角/全角", scan_code=41, event_type="down")
+            keyboard.emit(event)
+
+        self.assertFalse(app._altgr_pressed, "IME toggle should clear AltGr flag")
+        self.assertGreaterEqual(refresh_mock.call_count, 1)
 
     def test_stop_sets_event(self):
         app = self._create_app()
