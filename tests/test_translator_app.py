@@ -31,6 +31,7 @@ if "pystray" not in sys.modules:
     stub_pystray.MenuItem = _StubMenuItem
     sys.modules["pystray"] = stub_pystray
 
+import translator_app
 from translator_app import CCTranslationApp, TranslationRequest, SystemTrayController
 from translation_service import TranslationError
 
@@ -67,6 +68,17 @@ class FakeKeyboard:
 
     def unhook_all(self):  # pragma: no cover - only used in manual runs
         self.unhooked = True
+
+
+class RecordingKeyboard(FakeKeyboard):
+    def __init__(self) -> None:
+        super().__init__()
+        self.callbacks = {}
+
+    def add_hotkey(self, *args, **kwargs):  # pragma: no cover - invoked via tests
+        super().add_hotkey(*args, **kwargs)
+        if len(args) >= 2 and callable(args[1]):
+            self.callbacks[args[0]] = args[1]
 
 
 class FakeTranslator:
@@ -298,6 +310,28 @@ class CCTranslationAppTests(CCTranslationAppTestMixin, unittest.TestCase):
         app._process_single_request(request)
         self.assertEqual(len(translators), 2, "reboot should clear cached translator")
         self.assertIsNot(translators[0], translators[1])
+
+    def test_ime_toggle_hotkey_resets_altgr_state(self):
+        keyboard = RecordingKeyboard()
+        app = self._create_app(keyboard_module=keyboard)
+        fake_state = types.SimpleNamespace(altgr_is_pressed=True, ignore_next_right_alt=True)
+
+        with mock.patch.object(translator_app, "_winkeyboard", fake_state), mock.patch(
+            "translator_app.sys.platform", "win32"
+        ):
+            app._register_copy_hotkeys()
+
+            callback = None
+            for combo, cb in keyboard.callbacks.items():
+                if combo in ("ime hangul mode", "ime kanji mode"):
+                    callback = cb
+                    break
+
+            self.assertIsNotNone(callback)
+            if callback is not None:
+                callback()
+        self.assertFalse(fake_state.altgr_is_pressed)
+        self.assertFalse(fake_state.ignore_next_right_alt)
 
 
 class CCTranslationAppLifecycleTests(CCTranslationAppTestMixin, unittest.TestCase):

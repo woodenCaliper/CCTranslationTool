@@ -48,6 +48,15 @@ import tempfile
 from translation_service import GoogleTranslateClient, TranslationError, TranslationResult
 
 
+if sys.platform == "win32" and keyboard is not None:  # pragma: no cover - Windows specific branch
+    try:  # pragma: no cover - executed when keyboard is available
+        import keyboard._winkeyboard as _winkeyboard  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover - failure falls back to no-op workaround
+        _winkeyboard = None  # type: ignore[assignment]
+else:  # pragma: no cover - non-Windows platforms
+    _winkeyboard = None  # type: ignore[assignment]
+
+
 DOUBLE_COPY_INTERVAL = 0.5  # Seconds allowed between two copy events.
 
 PREFERENCES_FILE = Path.home() / ".cctranslationtool_preferences.json"
@@ -714,6 +723,7 @@ class CCTranslationApp:
         self._tray_controller: Optional[SystemTrayController] = None
         self._language_options = list(LANGUAGE_SEQUENCE)
         self._last_original_text: Optional[str] = None
+        self._ime_hotkeys_registered = False
 
     @property
     def translator(self) -> TranslatorProtocol:
@@ -723,6 +733,35 @@ class CCTranslationApp:
             translator = self._translator
         assert translator is not None  # For type checkers
         return translator
+
+    def _register_copy_hotkeys(self) -> None:
+        self._keyboard.add_hotkey("ctrl+c", self._handle_copy_event, suppress=False)
+        self._register_ime_toggle_workaround()
+
+    def _register_ime_toggle_workaround(self) -> None:
+        if self._ime_hotkeys_registered:
+            return
+        if sys.platform != "win32":
+            return
+        if _winkeyboard is None:
+            return
+
+        def ensure_altgr_released() -> None:
+            if _winkeyboard is None:  # pragma: no cover - defensive guard
+                return
+            _winkeyboard.altgr_is_pressed = False
+            _winkeyboard.ignore_next_right_alt = False
+
+        registered_any = False
+        for key_name in ("ime hangul mode", "ime kanji mode"):
+            try:
+                self._keyboard.add_hotkey(key_name, ensure_altgr_released, suppress=False)
+            except Exception:  # pragma: no cover - hotkey name unsupported
+                continue
+            else:
+                registered_any = True
+        if registered_any:
+            self._ime_hotkeys_registered = True
 
     def _reset_translator(self) -> None:
         with self._translator_lock:
@@ -738,7 +777,8 @@ class CCTranslationApp:
             self._worker_thread.start()
 
         while True:
-            self._keyboard.add_hotkey("ctrl+c", self._handle_copy_event, suppress=False)
+            self._ime_hotkeys_registered = False
+            self._register_copy_hotkeys()
 
             print(
                 "CCTranslationTool is running. Double press Ctrl+C on selected text to translate."
