@@ -736,6 +736,7 @@ class CCTranslationApp:
         self._tray_controller: Optional[SystemTrayController] = None
         self._language_options = list(LANGUAGE_SEQUENCE)
         self._last_original_text: Optional[str] = None
+        self._hotkey_handles: dict[str, int] = {}
 
     @property
     def translator(self) -> TranslatorProtocol:
@@ -770,7 +771,15 @@ class CCTranslationApp:
             )
 
         while True:
-            self._keyboard.add_hotkey("ctrl+c", self._handle_copy_event, suppress=False)
+            self._hotkey_handles["copy"] = self._keyboard.add_hotkey(
+                "ctrl+c", self._handle_copy_event, suppress=False
+            )
+            self._hotkey_handles["heartbeat"] = self._keyboard.add_hotkey(
+                "ctrl+shift+h", self._log_hotkey_heartbeat, suppress=False
+            )
+            self._hotkey_handles["diagnostics"] = self._keyboard.add_hotkey(
+                "ctrl+shift+d", self._dump_diagnostics, suppress=False
+            )
 
             logger.info(
                 "CCTranslationTool is running. Double press Ctrl+C on selected text to translate.",
@@ -786,6 +795,11 @@ class CCTranslationApp:
                 self._keyboard.unhook_all()
                 if self._tray_controller is not None:
                     self._tray_controller.stop()
+                if hasattr(self._keyboard, "remove_hotkey"):
+                    for handle in self._hotkey_handles.values():
+                        with contextlib.suppress(KeyError):
+                            self._keyboard.remove_hotkey(handle)
+                self._hotkey_handles.clear()
 
             if self._restart_event.is_set():
                 self._restart_event.clear()
@@ -859,7 +873,9 @@ class CCTranslationApp:
             )
             if double_copy:
                 try:
+                    clipboard_start = time.perf_counter()
                     text = self._clipboard.paste()
+                    clipboard_duration = time.perf_counter() - clipboard_start
                 except Exception as exc:  # pragma: no cover - exercised via unit tests
                     if pyperclip is not None and isinstance(exc, pyperclip.PyperclipException):
                         message = f"Failed to read clipboard: {exc}"
@@ -871,6 +887,7 @@ class CCTranslationApp:
                     return
                 text = text.strip()
                 if text:
+                    logger.info("Clipboard read completed in %.3f seconds", clipboard_duration)
                     self._request_queue.put(
                         TranslationRequest(text=text, src=self.source_language, dest=self.dest_language)
                     )
@@ -940,6 +957,40 @@ class CCTranslationApp:
             return
         self._request_queue.put(
             TranslationRequest(text=text, src=src, dest=dest, reposition=False)
+        )
+
+    def _log_hotkey_heartbeat(self) -> None:
+        worker_alive = self._worker_thread.is_alive() if self._worker_thread else False
+        queue_size = self._request_queue.qsize()
+        with self._lock:
+            pending_copy = self._copy_detector.pending_count
+            last_interval = self._copy_detector.last_interval
+        logger.info(
+            "Hotkey heartbeat triggered (worker_alive=%s, queue_size=%d, pending_copy=%d, interval=%.3f)",
+            worker_alive,
+            queue_size,
+            pending_copy,
+            last_interval,
+        )
+
+    def _dump_diagnostics(self) -> None:
+        worker_alive = self._worker_thread.is_alive() if self._worker_thread else False
+        queue_size = self._request_queue.qsize()
+        threads = ", ".join(
+            f"{thread.name}(alive={thread.is_alive()})" for thread in threading.enumerate()
+        )
+        with self._lock:
+            pending_copy = self._copy_detector.pending_count
+            last_interval = self._copy_detector.last_interval
+        logger.info(
+            "Diagnostics dump: worker_alive=%s, queue_size=%d, pending_copy=%d, interval=%.3f, restart=%s, stop=%s, threads=[%s]",
+            worker_alive,
+            queue_size,
+            pending_copy,
+            last_interval,
+            self._restart_event.is_set(),
+            self._stop_event.is_set(),
+            threads,
         )
 
 
