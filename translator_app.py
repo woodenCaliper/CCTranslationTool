@@ -861,41 +861,53 @@ class CCTranslationApp:
         self._enqueue_retranslation(last_text, src, dest)
 
     def _handle_copy_event(self) -> None:
+        worker_alive = self._worker_thread.is_alive() if self._worker_thread else False
         with self._lock:
             double_copy = self._copy_detector.register()
             current_count = 2 if double_copy else self._copy_detector.pending_count
-            logger.info(
-                "Copy event handled (double=%s, count=%d, interval=%.3f, worker_alive=%s)",
-                double_copy,
-                current_count,
-                self._copy_detector.last_interval,
-                self._worker_thread.is_alive() if self._worker_thread else False,
-            )
-            if double_copy:
-                try:
-                    clipboard_start = time.perf_counter()
-                    text = self._clipboard.paste()
-                    clipboard_duration = time.perf_counter() - clipboard_start
-                except Exception as exc:  # pragma: no cover - exercised via unit tests
-                    if pyperclip is not None and isinstance(exc, pyperclip.PyperclipException):
-                        message = f"Failed to read clipboard: {exc}"
-                    else:
-                        message = f"Unexpected error while accessing clipboard: {exc}"
-                    logger.warning(message)
-                    print(message)
-                    self._copy_detector.reset()
-                    return
-                text = text.strip()
-                if text:
-                    logger.info("Clipboard read completed in %.3f seconds", clipboard_duration)
-                    self._request_queue.put(
-                        TranslationRequest(text=text, src=self.source_language, dest=self.dest_language)
-                    )
-                    logger.info(
-                        "Enqueued translation request (length=%d, queue_size=%d)",
-                        len(text),
-                        self._request_queue.qsize(),
-                    )
+            last_interval = self._copy_detector.last_interval
+        logger.info(
+            "Copy event handled (double=%s, count=%d, interval=%.3f, worker_alive=%s)",
+            double_copy,
+            current_count,
+            last_interval,
+            worker_alive,
+        )
+        if not double_copy:
+            return
+
+        try:
+            clipboard_start = time.perf_counter()
+            text = self._clipboard.paste()
+            clipboard_duration = time.perf_counter() - clipboard_start
+        except Exception as exc:  # pragma: no cover - exercised via unit tests
+            if pyperclip is not None and isinstance(exc, pyperclip.PyperclipException):
+                message = f"Failed to read clipboard: {exc}"
+            else:
+                message = f"Unexpected error while accessing clipboard: {exc}"
+            logger.warning(message)
+            print(message)
+            with self._lock:
+                self._copy_detector.reset()
+            return
+
+        text = text.strip()
+        if not text:
+            return
+
+        with self._lock:
+            src = self.source_language
+            dest = self.dest_language
+
+        logger.info("Clipboard read completed in %.3f seconds", clipboard_duration)
+        self._request_queue.put(
+            TranslationRequest(text=text, src=src, dest=dest)
+        )
+        logger.info(
+            "Enqueued translation request (length=%d, queue_size=%d)",
+            len(text),
+            self._request_queue.qsize(),
+        )
 
     def _process_requests(self) -> None:
         while True:
