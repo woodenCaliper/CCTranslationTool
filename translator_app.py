@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import queue
 import threading
 import time
+import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -48,6 +50,9 @@ import tempfile
 from translation_service import GoogleTranslateClient, TranslationError, TranslationResult
 
 
+logger = logging.getLogger(__name__)
+
+
 DOUBLE_COPY_INTERVAL = 0.5  # Seconds allowed between two copy events.
 
 PREFERENCES_FILE = Path.home() / ".cctranslationtool_preferences.json"
@@ -59,6 +64,32 @@ LANGUAGE_DISPLAY_NAMES = {
     "auto": "自動検出",
     None: "自動検出",
 }
+
+TROUBLESHOOTING_GUIDE = textwrap.dedent(
+    """
+    ================================
+    CCTranslationTool トラブルシューティング手順
+    ================================
+
+    1. 再現したら Ctrl+Shift+H（ハートビート）と Ctrl+Shift+D（診断ダンプ）を押し、
+       ログにワーカー・キュー・リスナーの状態を残してください。
+    2. `--debug-key-events` フラグ付きで起動し、Ctrl+Shift+E を押して最新のキーイベント統計を記録するとホットキー層の停止を切り分けられます。
+    3. `Keyboard permission status` の 10 秒ごとの出力で `pending_copy`・`listener_state`・`last_copy_age` を追跡し、値が変化しなくなったタイミングを控えてください。
+    4. 低レベルのキーイベントが届いているかを確認するため、別ターミナルで `python keyboard_hook_probe.py --log keyboard_events.log` を実行し、問題発生時に Ctrl+C が記録されるかを比較してください。
+    5. 取得したログと再現手順（直前に押したキー、表示されたメッセージ）を添えて報告していただけると原因特定が進みます。
+    """
+)
+
+
+def print_troubleshooting_guide(stream: Optional[IO[str]] = None) -> None:
+    """Output recommended investigation steps for stalled hotkeys."""
+
+    if stream is None:
+        stream = sys.stdout
+    stream.write(TROUBLESHOOTING_GUIDE)
+    if not TROUBLESHOOTING_GUIDE.endswith("\n"):
+        stream.write("\n")
+    stream.flush()
 
 
 def _load_saved_dest_language(default: str = "ja") -> str:
@@ -110,8 +141,9 @@ class DoubleCopyDetector:
 
     interval: float
     now: Callable[[], float]
-    _last_time: float = field(default=0.0, init=False)
+    _last_time: Optional[float] = field(default=None, init=False)
     _count: int = field(default=0, init=False)
+    _last_interval: float = field(default=0.0, init=False)
 
     def register(self) -> bool:
         """Register a copy event.
@@ -119,8 +151,12 @@ class DoubleCopyDetector:
         Returns ``True`` if the event completes a "double copy" sequence.
         """
 
+        previous_time = self._last_time
         current = self.now()
-        if current - self._last_time <= self.interval:
+        interval_since_last = current - previous_time if previous_time is not None else float("inf")
+        self._last_interval = interval_since_last
+
+        if previous_time is not None and interval_since_last <= self.interval:
             self._count += 1
         else:
             self._count = 1
@@ -134,8 +170,101 @@ class DoubleCopyDetector:
     def reset(self) -> None:
         """Reset the detector state so future copies restart the sequence."""
 
-        self._last_time = 0.0
+        self._last_time = None
         self._count = 0
+        self._last_interval = 0.0
+
+    @property
+    def pending_count(self) -> int:
+        """Return the current number of consecutive copy events."""
+
+        return self._count
+
+    @property
+    def last_interval(self) -> float:
+        """Return the time elapsed since the previous copy event."""
+
+        return self._last_interval
+
+    @property
+    def last_event_time(self) -> Optional[float]:
+        """Return the timestamp of the most recent copy event, if known."""
+
+        return self._last_time
+
+
+@dataclass
+class KeyboardEventRecorder:
+    """Record key events observed by the ``keyboard`` hook for diagnostics."""
+
+    keyboard_module: object
+    time_provider: Callable[[], float]
+    tracked_keys: tuple[str, ...] = ("ctrl", "left ctrl", "right ctrl", "c")
+    _hook: Optional[Callable[[object], None]] = field(default=None, init=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+    _last_events: dict[str, float] = field(default_factory=dict, init=False)
+    _total_events: int = field(default=0, init=False)
+
+    def start(self) -> None:
+        """Begin recording keyboard events if the module supports hooks."""
+
+        if self._hook is not None:
+            return
+        hook = getattr(self.keyboard_module, "hook", None)
+        if callable(hook):
+            self._hook = hook(self._handle_event)
+
+    def stop(self) -> None:
+        """Stop recording events and release the hook."""
+
+        if self._hook is None:
+            return
+        unhook = getattr(self.keyboard_module, "unhook", None)
+        if callable(unhook):
+            try:
+                unhook(self._hook)
+            except Exception:  # pragma: no cover - defensive cleanup
+                logger.exception("Failed to unhook keyboard event recorder")
+        self._hook = None
+
+    def _handle_event(self, event: object) -> None:
+        name = getattr(event, "name", None)
+        if not isinstance(name, str):
+            return
+        normalized = name.lower()
+        if normalized not in self.tracked_keys:
+            return
+        timestamp = self.time_provider()
+        with self._lock:
+            self._last_events[normalized] = timestamp
+            self._last_events["__last__"] = timestamp
+            self._total_events += 1
+
+    def snapshot(self) -> dict[str, object]:
+        """Return ages of the most recent tracked events for logging."""
+
+        now = self.time_provider()
+        with self._lock:
+            last_ctrl_time = max(
+                (
+                    self._last_events[key]
+                    for key in ("ctrl", "left ctrl", "right ctrl")
+                    if key in self._last_events
+                ),
+                default=None,
+            )
+            last_c_time = self._last_events.get("c")
+            last_event_time = self._last_events.get("__last__")
+            total_events = self._total_events
+        def _age(value: Optional[float]) -> Optional[float]:
+            return None if value is None else max(0.0, now - value)
+
+        return {
+            "last_ctrl_age": _age(last_ctrl_time),
+            "last_c_age": _age(last_c_time),
+            "last_event_age": _age(last_event_time),
+            "total_events": total_events,
+        }
 
 
 class SingleInstanceError(RuntimeError):
@@ -681,12 +810,14 @@ class CCTranslationApp:
         time_provider: Callable[[], float] = time.time,
         display_callback: Optional[Callable[[str, str, Optional[str]], None]] = None,
         double_copy_interval: float = DOUBLE_COPY_INTERVAL,
+        debug_key_events: bool = False,
     ) -> None:
         self.dest_language = dest_language
         self.source_language = source_language
         self._translator: Optional[TranslatorProtocol] = None
         self._translator_factory = translator_factory
         self._translator_lock = threading.Lock()
+        self._time_provider = time_provider
         self._copy_detector = DoubleCopyDetector(double_copy_interval, time_provider)
         self._lock = threading.Lock()
         self._request_queue: "queue.Queue[TranslationRequest]" = queue.Queue()
@@ -714,6 +845,20 @@ class CCTranslationApp:
         self._tray_controller: Optional[SystemTrayController] = None
         self._language_options = list(LANGUAGE_SEQUENCE)
         self._last_original_text: Optional[str] = None
+        self._hotkey_handles: dict[str, int] = {}
+        self._hotkey_lock = threading.Lock()
+        self._hotkeys_active = threading.Event()
+        self._monitor_stop_event = threading.Event()
+        self._keyboard_monitor_thread: Optional[threading.Thread] = None
+        self._last_copy_timestamp: float = 0.0
+        self._last_keyboard_listener_state: Optional[bool] = None
+        self._last_keyboard_status_log: float = 0.0
+        self._worker_failure_logged = False
+        self._key_event_recorder = (
+            KeyboardEventRecorder(self._keyboard, self._time_provider)
+            if debug_key_events
+            else None
+        )
 
     @property
     def translator(self) -> TranslatorProtocol:
@@ -728,20 +873,238 @@ class CCTranslationApp:
         with self._translator_lock:
             self._translator = None
 
+    def _register_hotkeys(self, *, force: bool = False) -> None:
+        with self._hotkey_lock:
+            if not force and self._hotkey_handles:
+                return
+            self._remove_hotkeys_locked()
+            self._hotkey_handles["copy"] = self._keyboard.add_hotkey(
+                "ctrl+c", self._handle_copy_event, suppress=False
+            )
+            self._hotkey_handles["heartbeat"] = self._keyboard.add_hotkey(
+                "ctrl+shift+h", self._log_hotkey_heartbeat, suppress=False
+            )
+            self._hotkey_handles["diagnostics"] = self._keyboard.add_hotkey(
+                "ctrl+shift+d", self._dump_diagnostics, suppress=False
+            )
+            self._hotkey_handles["key_events"] = self._keyboard.add_hotkey(
+                "ctrl+shift+e", self._log_key_event_snapshot, suppress=False
+            )
+            self._hotkeys_active.set()
+
+    def _remove_hotkeys(self) -> None:
+        with self._hotkey_lock:
+            self._remove_hotkeys_locked()
+
+    def _remove_hotkeys_locked(self) -> None:
+        if hasattr(self._keyboard, "remove_hotkey"):
+            for handle in list(self._hotkey_handles.values()):
+                with contextlib.suppress(KeyError):
+                    self._keyboard.remove_hotkey(handle)
+        self._hotkey_handles.clear()
+        self._hotkeys_active.clear()
+
+    def _get_keyboard_listener_state(self) -> Optional[bool]:
+        listener = getattr(self._keyboard, "_listener", None)
+        listening = getattr(listener, "listening", None)
+        if isinstance(listening, bool):
+            self._last_keyboard_listener_state = listening
+            return listening
+        return None
+
+    def _start_keyboard_monitor(self) -> None:
+        if self._keyboard_monitor_thread and self._keyboard_monitor_thread.is_alive():
+            return
+        self._monitor_stop_event.clear()
+        thread = threading.Thread(
+            target=self._monitor_keyboard_listener,
+            name="KeyboardMonitor",
+            daemon=True,
+        )
+        self._keyboard_monitor_thread = thread
+        thread.start()
+
+    def _stop_keyboard_monitor(self) -> None:
+        self._monitor_stop_event.set()
+        thread = self._keyboard_monitor_thread
+        if thread is not None:
+            thread.join(timeout=1.0)
+        self._keyboard_monitor_thread = None
+
+    def _monitor_keyboard_listener(self) -> None:
+        failure_count = 0
+        while not self._monitor_stop_event.wait(1.0):
+            failure_count, listener_state = self._check_keyboard_listener(failure_count)
+            self._log_keyboard_status(listener_state, failure_count)
+
+    def _check_keyboard_listener(
+        self, failure_count: int
+    ) -> tuple[int, Optional[bool]]:
+        listener_state = self._get_keyboard_listener_state()
+        if not self._hotkeys_active.is_set():
+            return 0, listener_state
+        if listener_state is None:
+            return 0, None
+        if listener_state:
+            return 0, True
+        failure_count += 1
+        logger.warning(
+            "Keyboard listener inactive (attempt=%d); requesting restart", failure_count
+        )
+        listener = getattr(self._keyboard, "_listener", None)
+        restart = getattr(listener, "start_if_necessary", None)
+        if callable(restart):
+            try:
+                restart()
+            except Exception:
+                logger.exception("Failed to restart keyboard listener")
+            else:
+                logger.info("Keyboard listener restart requested")
+        self._register_hotkeys(force=True)
+        return failure_count, False
+
+    def _get_keyboard_listener_thread_alive(self) -> Optional[bool]:
+        listener = getattr(self._keyboard, "_listener", None)
+        thread = getattr(listener, "thread", None)
+        if isinstance(thread, threading.Thread):
+            return thread.is_alive()
+        if hasattr(thread, "is_alive"):
+            try:
+                return bool(thread.is_alive())
+            except Exception:  # pragma: no cover - defensive fallback
+                return None
+        return None
+
+    def _collect_runtime_status(
+        self,
+        *,
+        known_listener_state: Optional[bool] = None,
+        failure_count: Optional[int] = None,
+    ) -> dict[str, object]:
+        worker_thread = self._worker_thread if self._worker_thread else None
+        worker_alive = bool(worker_thread and worker_thread.is_alive())
+        worker_name = worker_thread.name if worker_thread is not None else None
+        try:
+            queue_size = self._request_queue.qsize()
+        except NotImplementedError:  # pragma: no cover - platform dependent guard
+            queue_size = None
+        with self._lock:
+            pending_copy = self._copy_detector.pending_count
+            last_interval = self._copy_detector.last_interval
+            last_copy_timestamp = self._last_copy_timestamp
+        if known_listener_state is None:
+            listener_state = self._get_keyboard_listener_state()
+        else:
+            listener_state = known_listener_state
+            self._last_keyboard_listener_state = known_listener_state
+        listener_thread_alive = self._get_keyboard_listener_thread_alive()
+        monitor_alive = (
+            self._keyboard_monitor_thread.is_alive()
+            if self._keyboard_monitor_thread
+            else False
+        )
+        hotkeys_active = self._hotkeys_active.is_set()
+        last_copy_age = (
+            self._time_provider() - last_copy_timestamp
+            if last_copy_timestamp
+            else None
+        )
+        status = {
+            "worker_alive": worker_alive,
+            "worker_thread_name": worker_name,
+            "queue_size": queue_size,
+            "pending_copy": pending_copy,
+            "last_interval": last_interval,
+            "last_copy_timestamp": last_copy_timestamp or None,
+            "last_copy_age": last_copy_age,
+            "listener_state": listener_state,
+            "listener_thread_alive": listener_thread_alive,
+            "monitor_alive": monitor_alive,
+            "hotkeys_active": hotkeys_active,
+            "failure_count": failure_count,
+            "key_event_stats": (
+                self._key_event_recorder.snapshot()
+                if self._key_event_recorder is not None
+                else None
+            ),
+        }
+        return status
+
+    def _log_keyboard_status(
+        self, listener_state: Optional[bool], failure_count: int
+    ) -> None:
+        now = self._time_provider()
+        if now - self._last_keyboard_status_log < 10.0:
+            return
+        self._last_keyboard_status_log = now
+        status = self._collect_runtime_status(
+            known_listener_state=listener_state, failure_count=failure_count
+        )
+        last_copy_age = status["last_copy_age"]
+        queue_size = status["queue_size"]
+        logger.info(
+            "Keyboard permission status: hotkeys_active=%s, listener_state=%s, listener_thread_alive=%s, monitor_alive=%s, failure_count=%d, hotkey_handles=%d, worker_alive=%s, worker_thread=%s, queue_size=%s, pending_copy=%d, interval=%.3f, last_copy_age=%s",
+            status["hotkeys_active"],
+            status["listener_state"],
+            status["listener_thread_alive"],
+            status["monitor_alive"],
+            failure_count,
+            len(self._hotkey_handles),
+            status["worker_alive"],
+            status["worker_thread_name"],
+            "unknown" if queue_size is None else queue_size,
+            status["pending_copy"],
+            status["last_interval"],
+            None if last_copy_age is None else f"{last_copy_age:.3f}",
+        )
+        if status["key_event_stats"] is not None:
+            logger.info(
+                "Keyboard low-level events: %s",
+                self._format_key_event_stats(status["key_event_stats"]),
+            )
+        if not status["worker_alive"]:
+            if not self._worker_failure_logged:
+                logger.warning(
+                    "Worker thread not alive (thread=%s, queue_size=%s, pending_copy=%d)",
+                    status["worker_thread_name"],
+                    "unknown" if queue_size is None else queue_size,
+                    status["pending_copy"],
+                )
+                self._worker_failure_logged = True
+        else:
+            self._worker_failure_logged = False
+
     def start(self, *, tray_controller: Optional[SystemTrayController] = None) -> None:
         """Start listening for keyboard events and processing translations."""
 
         self._tray_controller = tray_controller
 
         if self._worker_thread is None or not self._worker_thread.is_alive():
-            self._worker_thread = threading.Thread(target=self._process_requests, daemon=True)
+            self._worker_thread = threading.Thread(
+                target=self._process_requests,
+                name="TranslationWorker",
+                daemon=True,
+            )
             self._worker_thread.start()
+            logger.info("Started worker thread %s", self._worker_thread.name)
+        else:
+            logger.info(
+                "Worker thread already running (alive=%s)",
+                self._worker_thread.is_alive(),
+            )
+
+        if self._key_event_recorder is not None:
+            self._key_event_recorder.start()
 
         while True:
-            self._keyboard.add_hotkey("ctrl+c", self._handle_copy_event, suppress=False)
+            self._start_keyboard_monitor()
+            self._register_hotkeys(force=True)
 
-            print(
-                "CCTranslationTool is running. Double press Ctrl+C on selected text to translate."
+            logger.info(
+                "CCTranslationTool is running. Double press Ctrl+C on selected text to translate.",
+            )
+            logger.info(
+                "トラブルが発生したら Ctrl+Shift+H / Ctrl+Shift+D / Ctrl+Shift+E でログを取得し、詳細手順は '--show-debug-guide' で確認してください。"
             )
             if self._tray_controller is not None:
                 self._tray_controller.start()
@@ -751,7 +1114,9 @@ class CCTranslationApp:
             except KeyboardInterrupt:  # pragma: no cover - manual console interruption
                 self.stop()
             finally:
-                self._keyboard.unhook_all()
+                self._remove_hotkeys()
+                if hasattr(self._keyboard, "unhook_all"):
+                    self._keyboard.unhook_all()
                 if self._tray_controller is not None:
                     self._tray_controller.stop()
 
@@ -762,11 +1127,17 @@ class CCTranslationApp:
 
             break
 
+        self._stop_keyboard_monitor()
+        if self._key_event_recorder is not None:
+            self._key_event_recorder.stop()
+
     def stop(self) -> None:
         """Signal the application to shut down."""
 
         self._restart_event.clear()
         self._stop_event.set()
+        self._monitor_stop_event.set()
+        self._hotkeys_active.clear()
 
     def reboot(self) -> None:
         """Restart the application loop and reset cached translator state."""
@@ -815,29 +1186,66 @@ class CCTranslationApp:
         self._enqueue_retranslation(last_text, src, dest)
 
     def _handle_copy_event(self) -> None:
+        worker_alive = self._worker_thread.is_alive() if self._worker_thread else False
         with self._lock:
-            if self._copy_detector.register():
-                try:
-                    text = self._clipboard.paste()
-                except Exception as exc:  # pragma: no cover - exercised via unit tests
-                    if pyperclip is not None and isinstance(exc, pyperclip.PyperclipException):
-                        message = f"Failed to read clipboard: {exc}"
-                    else:
-                        message = f"Unexpected error while accessing clipboard: {exc}"
-                    print(message)
-                    self._copy_detector.reset()
-                    return
-                text = text.strip()
-                if text:
-                    self._request_queue.put(
-                        TranslationRequest(text=text, src=self.source_language, dest=self.dest_language)
-                    )
+            double_copy = self._copy_detector.register()
+            current_count = 2 if double_copy else self._copy_detector.pending_count
+            last_interval = self._copy_detector.last_interval
+            last_event_time = self._copy_detector.last_event_time
+            if last_event_time is not None:
+                self._last_copy_timestamp = last_event_time
+            else:
+                self._last_copy_timestamp = self._time_provider()
+        logger.info(
+            "Copy event handled (double=%s, count=%d, interval=%.3f, worker_alive=%s)",
+            double_copy,
+            current_count,
+            last_interval,
+            worker_alive,
+        )
+        if not double_copy:
+            return
+
+        try:
+            clipboard_start = time.perf_counter()
+            text = self._clipboard.paste()
+            clipboard_duration = time.perf_counter() - clipboard_start
+        except Exception as exc:  # pragma: no cover - exercised via unit tests
+            if pyperclip is not None and isinstance(exc, pyperclip.PyperclipException):
+                message = f"Failed to read clipboard: {exc}"
+            else:
+                message = f"Unexpected error while accessing clipboard: {exc}"
+            logger.warning(message)
+            print(message)
+            with self._lock:
+                self._copy_detector.reset()
+            return
+
+        text = text.strip()
+        if not text:
+            return
+
+        with self._lock:
+            src = self.source_language
+            dest = self.dest_language
+
+        logger.info("Clipboard read completed in %.3f seconds", clipboard_duration)
+        self._request_queue.put(
+            TranslationRequest(text=text, src=src, dest=dest)
+        )
+        logger.info(
+            "Enqueued translation request (length=%d, queue_size=%d)",
+            len(text),
+            self._request_queue.qsize(),
+        )
 
     def _process_requests(self) -> None:
         while True:
             request = self._request_queue.get()
             try:
                 self._process_single_request(request)
+            except Exception:
+                logger.exception("Unhandled error while processing request: %s", request)
             finally:
                 self._request_queue.task_done()
 
@@ -893,6 +1301,86 @@ class CCTranslationApp:
             TranslationRequest(text=text, src=src, dest=dest, reposition=False)
         )
 
+    def _log_hotkey_heartbeat(self) -> None:
+        status = self._collect_runtime_status()
+        queue_size = status["queue_size"]
+        last_copy_age = status["last_copy_age"]
+        logger.info(
+            "Hotkey heartbeat triggered (worker_alive=%s, queue_size=%d, pending_copy=%d, interval=%.3f, listener_active=%s, listener_thread_alive=%s, monitor_alive=%s, last_copy_age=%s)",
+            status["worker_alive"],
+            -1 if queue_size is None else queue_size,
+            status["pending_copy"],
+            status["last_interval"],
+            status["listener_state"],
+            status["listener_thread_alive"],
+            status["monitor_alive"],
+            None if last_copy_age is None else f"{last_copy_age:.3f}",
+        )
+        if status["key_event_stats"] is not None:
+            logger.info(
+                "Keyboard low-level events: %s",
+                self._format_key_event_stats(status["key_event_stats"]),
+            )
+
+    def _format_key_event_stats(self, stats: Optional[dict[str, object]]) -> str:
+        if not stats:
+            return "disabled"
+
+        def _fmt(value: object) -> str:
+            if value is None:
+                return "None"
+            if isinstance(value, (int, float)):
+                if isinstance(value, int):
+                    return str(value)
+                return f"{value:.3f}"
+            return str(value)
+
+        return (
+            "events={events}, last_ctrl={last_ctrl}, last_c={last_c}, last_event={last_event}".format(
+                events=_fmt(stats.get("total_events")),
+                last_ctrl=_fmt(stats.get("last_ctrl_age")),
+                last_c=_fmt(stats.get("last_c_age")),
+                last_event=_fmt(stats.get("last_event_age")),
+            )
+        )
+
+    def _log_key_event_snapshot(self) -> None:
+        stats = (
+            self._key_event_recorder.snapshot()
+            if self._key_event_recorder is not None
+            else None
+        )
+        logger.info("Keyboard event snapshot: %s", self._format_key_event_stats(stats))
+
+    def _dump_diagnostics(self) -> None:
+        status = self._collect_runtime_status()
+        queue_size = status["queue_size"]
+        threads = ", ".join(
+            f"{thread.name}(alive={thread.is_alive()})" for thread in threading.enumerate()
+        )
+        logger.info(
+            "Diagnostics dump: worker_alive=%s, queue_size=%d, pending_copy=%d, interval=%.3f, restart=%s, stop=%s, listener_active=%s, listener_thread_alive=%s, monitor_alive=%s, hotkeys_active=%s, last_copy_age=%s, threads=[%s]",
+            status["worker_alive"],
+            -1 if queue_size is None else queue_size,
+            status["pending_copy"],
+            status["last_interval"],
+            self._restart_event.is_set(),
+            self._stop_event.is_set(),
+            status["listener_state"],
+            status["listener_thread_alive"],
+            status["monitor_alive"],
+            self._hotkeys_active.is_set(),
+            None
+            if status["last_copy_age"] is None
+            else f"{status['last_copy_age']:.3f}",
+            threads,
+        )
+        if status["key_event_stats"] is not None:
+            logger.info(
+                "Keyboard low-level events: %s",
+                self._format_key_event_stats(status["key_event_stats"]),
+            )
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Translate selected text after a double Ctrl+C.")
@@ -906,15 +1394,36 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Source language. Leave empty to auto-detect.",
     )
+    parser.add_argument(
+        "--debug-key-events",
+        action="store_true",
+        help="Log recent Ctrl/C key event timings seen by the keyboard hook.",
+    )
+    parser.add_argument(
+        "--show-debug-guide",
+        action="store_true",
+        help="Print recommended troubleshooting steps and exit.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    args = parse_args()
+    if getattr(args, "show_debug_guide", False):
+        print_troubleshooting_guide()
+        return
     try:
         with SingleInstanceGuard("cctranslationtool"):
-            args = parse_args()
             _save_dest_language(args.dest)
-            app = CCTranslationApp(dest_language=args.dest, source_language=args.src)
+            app = CCTranslationApp(
+                dest_language=args.dest,
+                source_language=args.src,
+                debug_key_events=args.debug_key_events,
+            )
             tray_controller = SystemTrayController(app)
             app.start(tray_controller=tray_controller)
     except SingleInstanceError:

@@ -8,6 +8,7 @@ import unittest
 import unittest.mock as mock
 from contextlib import redirect_stdout
 from types import SimpleNamespace
+from typing import Callable
 
 if "pystray" not in sys.modules:
     stub_pystray = types.ModuleType("pystray")
@@ -31,7 +32,13 @@ if "pystray" not in sys.modules:
     stub_pystray.MenuItem = _StubMenuItem
     sys.modules["pystray"] = stub_pystray
 
-from translator_app import CCTranslationApp, TranslationRequest, SystemTrayController
+from translator_app import (
+    CCTranslationApp,
+    TranslationRequest,
+    SystemTrayController,
+    parse_args,
+    print_troubleshooting_guide,
+)
 from translation_service import TranslationError
 
 
@@ -55,12 +62,47 @@ class FakeClipboard:
 
 
 class FakeKeyboard:
+    class Listener:
+        def __init__(self) -> None:
+            self.listening = True
+            self.start_calls = 0
+
+        def start_if_necessary(self) -> None:
+            self.start_calls += 1
+            self.listening = True
+
     def __init__(self) -> None:
         self.registered = []
+        self._handles: dict[int, tuple[tuple, dict]] = {}
         self.unhooked = False
+        self.removed: list[int] = []
+        self._next_handle = 1
+        self._listener = FakeKeyboard.Listener()
+        self._hooks: list[Callable[[object], None]] = []
 
     def add_hotkey(self, *args, **kwargs):  # pragma: no cover - only used in manual runs
+        handle = self._next_handle
+        self._next_handle += 1
         self.registered.append((args, kwargs))
+        self._handles[handle] = (args, kwargs)
+        return handle
+
+    def remove_hotkey(self, handle: int) -> None:  # pragma: no cover - only used in manual runs
+        self._handles.pop(handle, None)
+        self.removed.append(handle)
+
+    def hook(self, callback):  # pragma: no cover - tests enable explicitly
+        self._hooks.append(callback)
+        return callback
+
+    def unhook(self, callback):  # pragma: no cover - tests enable explicitly
+        if callback in self._hooks:
+            self._hooks.remove(callback)
+
+    def emit(self, event_name: str) -> None:
+        event = SimpleNamespace(name=event_name)
+        for callback in list(self._hooks):
+            callback(event)
 
     def wait(self):  # pragma: no cover - only used in manual runs
         raise RuntimeError("wait should not be called during tests")
@@ -179,6 +221,55 @@ class CCTranslationAppTests(CCTranslationAppTestMixin, unittest.TestCase):
         self.assertEqual(translator.calls, [("hello", None, "ja")])
         self.assertEqual(captured, [("hello", "translated", "en")])
 
+    def test_collect_runtime_status_defaults(self):
+        app = self._create_app()
+        status = app._collect_runtime_status()
+
+        self.assertFalse(status["worker_alive"])
+        self.assertIsNone(status["worker_thread_name"])
+        self.assertEqual(status["queue_size"], 0)
+        self.assertEqual(status["pending_copy"], 0)
+        self.assertEqual(status["last_interval"], 0.0)
+        self.assertTrue(status["listener_state"])
+        self.assertIsNone(status["listener_thread_alive"])
+        self.assertFalse(status["monitor_alive"])
+        self.assertFalse(status["hotkeys_active"])
+        self.assertIsNone(status["failure_count"])
+        self.assertIsNone(status["last_copy_age"])
+        self.assertIsNone(status["key_event_stats"])
+
+    def test_collect_runtime_status_with_known_listener_state(self):
+        app = self._create_app()
+        app._fake_time.advance(5.0)
+        app._last_copy_timestamp = app._fake_time.now() - 1.5
+
+        status = app._collect_runtime_status(known_listener_state=False, failure_count=3)
+
+        self.assertFalse(status["listener_state"])
+        self.assertEqual(status["failure_count"], 3)
+        self.assertAlmostEqual(status["last_copy_age"], 1.5)
+        self.assertEqual(app._last_keyboard_listener_state, False)
+
+    def test_key_event_recorder_snapshot(self):
+        app = self._create_app(debug_key_events=True)
+        recorder = app._key_event_recorder
+        self.assertIsNotNone(recorder)
+        assert recorder is not None
+        recorder.start()
+        app._keyboard.emit("c")
+        app._fake_time.advance(0.2)
+        app._keyboard.emit("ctrl")
+        stats = recorder.snapshot()
+        self.assertEqual(stats["total_events"], 2)
+        self.assertIsNotNone(stats["last_c_age"])
+        recorder.stop()
+
+    def test_key_event_snapshot_logging(self):
+        app = self._create_app(debug_key_events=True)
+        with mock.patch("translator_app.logger.info") as info_mock:
+            app._log_key_event_snapshot()
+        info_mock.assert_called()
+
     def test_process_single_request_handles_errors(self):
         captured = []
 
@@ -198,6 +289,43 @@ class CCTranslationAppTests(CCTranslationAppTestMixin, unittest.TestCase):
         self.assertFalse(app._stop_event.is_set())
         app.stop()
         self.assertTrue(app._stop_event.is_set())
+
+    def test_handle_copy_event_updates_last_copy_timestamp(self):
+        fake_time = FakeTime()
+        app = self._create_app(fake_time=fake_time)
+        self.assertEqual(app._last_copy_timestamp, 0.0)
+        app._handle_copy_event()
+        self.assertEqual(app._last_copy_timestamp, fake_time.now())
+
+    def test_keyboard_monitor_attempts_restart_when_listener_inactive(self):
+        app = self._create_app()
+        app._register_hotkeys(force=True)
+        app._keyboard._listener.listening = False
+        with mock.patch.object(app, "_register_hotkeys") as register_mock:
+            register_mock.side_effect = lambda force=False: None
+            failures, state = app._check_keyboard_listener(0)
+        self.assertEqual(failures, 1)
+        self.assertFalse(state)
+        self.assertEqual(app._keyboard._listener.start_calls, 1)
+        register_mock.assert_called_once_with(force=True)
+
+    def test_keyboard_monitor_noop_when_hotkeys_inactive(self):
+        app = self._create_app()
+        app._hotkeys_active.clear()
+        failures, state = app._check_keyboard_listener(2)
+        self.assertEqual(failures, 0)
+        self.assertTrue(state)
+        self.assertEqual(app._keyboard._listener.start_calls, 0)
+
+    def test_keyboard_status_logs_every_ten_seconds(self):
+        app = self._create_app()
+        app._register_hotkeys(force=True)
+        with mock.patch("translator_app.logger.info") as info_mock:
+            app._log_keyboard_status(True, 0)
+            self.assertFalse(info_mock.called)
+            app._fake_time.advance(10.1)
+            app._log_keyboard_status(True, 0)
+            info_mock.assert_called_once()
 
     def test_clipboard_error_does_not_enqueue_and_recovers(self):
         class LockedClipboard(FakeClipboard):
@@ -360,6 +488,24 @@ class SystemTrayControllerTests(unittest.TestCase):
 
         self.assertTrue(dummy_app.reboot_called)
         self.assertTrue(icon.stopped)
+
+
+class TroubleshootingGuideTests(unittest.TestCase):
+    def test_troubleshooting_guide_prints_expected_keywords(self) -> None:
+        buffer = io.StringIO()
+        print_troubleshooting_guide(buffer)
+        output = buffer.getvalue()
+        self.assertIn("Ctrl+Shift+H", output)
+        self.assertIn("keyboard_hook_probe.py", output)
+
+    def test_parse_args_exposes_show_debug_guide_flag(self) -> None:
+        original = sys.argv[:]
+        try:
+            sys.argv = ["translator_app.py", "--show-debug-guide"]
+            args = parse_args()
+        finally:
+            sys.argv = original
+        self.assertTrue(args.show_debug_guide)
 
 
 if __name__ == "__main__":
