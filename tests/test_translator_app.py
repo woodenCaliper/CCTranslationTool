@@ -8,6 +8,7 @@ import unittest
 import unittest.mock as mock
 from contextlib import redirect_stdout
 from types import SimpleNamespace
+from typing import Callable
 
 if "pystray" not in sys.modules:
     stub_pystray = types.ModuleType("pystray")
@@ -31,6 +32,7 @@ if "pystray" not in sys.modules:
     stub_pystray.MenuItem = _StubMenuItem
     sys.modules["pystray"] = stub_pystray
 
+import translator_app
 from translator_app import CCTranslationApp, TranslationRequest, SystemTrayController
 from translation_service import TranslationError
 
@@ -58,15 +60,59 @@ class FakeKeyboard:
     def __init__(self) -> None:
         self.registered = []
         self.unhooked = False
+        self.hooks = []
+        self.pressed: set[str] = set()
+        self.next_handle = 0
+        self.hotkeys: dict[object, tuple[tuple, dict]] = {}
+        self.removed: list[object] = []
 
     def add_hotkey(self, *args, **kwargs):  # pragma: no cover - only used in manual runs
+        handle = self.next_handle
+        self.next_handle += 1
         self.registered.append((args, kwargs))
+        self.hotkeys[handle] = (args, kwargs)
+        return handle
+
+    def remove_hotkey(self, handle):  # pragma: no cover - only used in manual runs
+        self.removed.append(handle)
+        self.hotkeys.pop(handle, None)
 
     def wait(self):  # pragma: no cover - only used in manual runs
         raise RuntimeError("wait should not be called during tests")
 
     def unhook_all(self):  # pragma: no cover - only used in manual runs
         self.unhooked = True
+
+    def hook(self, callback):  # pragma: no cover - overridden in tests when needed
+        self.hooks.append(callback)
+
+    def simulate_event(self, event):  # pragma: no cover - used only in targeted tests
+        for callback in list(self.hooks):
+            callback(event)
+
+    def is_pressed(self, key_name: str) -> bool:  # pragma: no cover - only used in debug tests
+        return key_name in self.pressed
+
+
+class RecordingKeyboard(FakeKeyboard):
+    def __init__(self) -> None:
+        super().__init__()
+        self.callbacks_by_combo: dict[str, Callable[[object], None]] = {}
+
+    def add_hotkey(self, *args, **kwargs):  # pragma: no cover - invoked via tests
+        handle = super().add_hotkey(*args, **kwargs)
+        if len(args) >= 2 and callable(args[1]):
+            combo = args[0]
+            self.callbacks_by_combo[combo] = args[1]
+        return handle
+
+    def remove_hotkey(self, handle):  # pragma: no cover - invoked via tests
+        combo = None
+        if handle in self.hotkeys:
+            combo = self.hotkeys[handle][0][0]
+        super().remove_hotkey(handle)
+        if combo is not None:
+            self.callbacks_by_combo.pop(combo, None)
 
 
 class FakeTranslator:
@@ -99,6 +145,7 @@ class CCTranslationAppTestMixin:
             time_provider=fake_time.now,
             display_callback=lambda original, translated, detected: None,
             double_copy_interval=0.5,
+            debug_keyboard=False,
         )
         defaults.update(overrides)
         app = CCTranslationApp(**defaults)
@@ -298,6 +345,93 @@ class CCTranslationAppTests(CCTranslationAppTestMixin, unittest.TestCase):
         app._process_single_request(request)
         self.assertEqual(len(translators), 2, "reboot should clear cached translator")
         self.assertIsNot(translators[0], translators[1])
+
+    def test_ime_toggle_hotkey_resets_altgr_state(self):
+        keyboard = RecordingKeyboard()
+        app = self._create_app(keyboard_module=keyboard)
+        fake_state = types.SimpleNamespace(altgr_is_pressed=True, ignore_next_right_alt=True)
+
+        with mock.patch.object(translator_app, "_winkeyboard", fake_state), mock.patch(
+            "translator_app.sys.platform", "win32"
+        ):
+            app._register_copy_hotkeys()
+
+            callback = None
+            for combo, cb in keyboard.callbacks_by_combo.items():
+                if combo in ("ime hangul mode", "ime kanji mode"):
+                    callback = cb
+                    break
+
+            self.assertIsNotNone(callback)
+            if callback is not None:
+                original_handle = app._copy_hotkey_handle
+                callback()
+                self.assertIsNotNone(app._copy_hotkey_handle)
+                self.assertNotEqual(app._copy_hotkey_handle, original_handle)
+                self.assertIn(original_handle, keyboard.removed)
+        self.assertFalse(fake_state.altgr_is_pressed)
+        self.assertFalse(fake_state.ignore_next_right_alt)
+
+    def test_ime_toggle_fallback_hook_resets_altgr_state(self):
+        class FallbackImeKeyboard(RecordingKeyboard):
+            def add_hotkey(self, combo, callback, suppress=False, **kwargs):  # type: ignore[override]
+                if combo in ("ime hangul mode", "ime kanji mode"):
+                    raise RuntimeError("unsupported hotkey")
+                return super().add_hotkey(combo, callback, suppress=suppress, **kwargs)
+
+        keyboard = FallbackImeKeyboard()
+        app = self._create_app(keyboard_module=keyboard)
+        fake_state = types.SimpleNamespace(altgr_is_pressed=True, ignore_next_right_alt=True)
+
+        with mock.patch.object(translator_app, "_winkeyboard", fake_state), mock.patch(
+            "translator_app.sys.platform", "win32"
+        ):
+            app._register_copy_hotkeys()
+            self.assertGreaterEqual(len(keyboard.hooks), 1)
+            event = types.SimpleNamespace(
+                event_type="down",
+                name="半角/全角",
+                scan_code=41,
+                is_keypad=False,
+                time=1.23,
+            )
+            original_handle = app._copy_hotkey_handle
+            keyboard.simulate_event(event)
+
+        self.assertFalse(fake_state.altgr_is_pressed)
+        self.assertFalse(fake_state.ignore_next_right_alt)
+        self.assertIsNotNone(app._copy_hotkey_handle)
+        self.assertNotEqual(app._copy_hotkey_handle, original_handle)
+        self.assertIn(original_handle, keyboard.removed)
+
+    def test_debug_keyboard_hook_logs_events(self):
+        keyboard = RecordingKeyboard()
+        fake_state = types.SimpleNamespace(altgr_is_pressed=True, ignore_next_right_alt=True)
+        app = self._create_app(keyboard_module=keyboard, debug_keyboard=True)
+
+        with mock.patch.object(translator_app, "_winkeyboard", fake_state), mock.patch(
+            "translator_app.sys.platform", "win32"
+        ):
+            with io.StringIO() as buffer, redirect_stdout(buffer):
+                app._register_copy_hotkeys()
+                self.assertEqual(len(keyboard.hooks), 1)
+                keyboard.pressed.add("ime kanji mode")
+                event = types.SimpleNamespace(
+                    event_type="down",
+                    name="ime kanji mode",
+                    scan_code=123,
+                    is_keypad=False,
+                    time=1.23,
+                )
+                keyboard.simulate_event(event)
+                output = buffer.getvalue()
+
+        self.assertIn("event_type=down", output)
+        self.assertIn("name=ime kanji mode", output)
+        self.assertIn(
+            "altgr_state={'altgr_is_pressed': True, 'ignore_next_right_alt': True}",
+            output,
+        )
 
 
 class CCTranslationAppLifecycleTests(CCTranslationAppTestMixin, unittest.TestCase):

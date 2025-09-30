@@ -48,6 +48,15 @@ import tempfile
 from translation_service import GoogleTranslateClient, TranslationError, TranslationResult
 
 
+if sys.platform == "win32" and keyboard is not None:  # pragma: no cover - Windows specific branch
+    try:  # pragma: no cover - executed when keyboard is available
+        import keyboard._winkeyboard as _winkeyboard  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover - failure falls back to no-op workaround
+        _winkeyboard = None  # type: ignore[assignment]
+else:  # pragma: no cover - non-Windows platforms
+    _winkeyboard = None  # type: ignore[assignment]
+
+
 DOUBLE_COPY_INTERVAL = 0.5  # Seconds allowed between two copy events.
 
 PREFERENCES_FILE = Path.home() / ".cctranslationtool_preferences.json"
@@ -681,6 +690,7 @@ class CCTranslationApp:
         time_provider: Callable[[], float] = time.time,
         display_callback: Optional[Callable[[str, str, Optional[str]], None]] = None,
         double_copy_interval: float = DOUBLE_COPY_INTERVAL,
+        debug_keyboard: bool = False,
     ) -> None:
         self.dest_language = dest_language
         self.source_language = source_language
@@ -714,6 +724,12 @@ class CCTranslationApp:
         self._tray_controller: Optional[SystemTrayController] = None
         self._language_options = list(LANGUAGE_SEQUENCE)
         self._last_original_text: Optional[str] = None
+        self._ime_hotkeys_registered = False
+        self._debug_keyboard = debug_keyboard
+        self._keyboard_debug_hook: Optional[Callable[[object], None]] = None
+        self._ime_fallback_hook: Optional[Callable[[object], None]] = None
+        self._copy_hotkey_handle: Optional[object] = None
+        self._hotkey_lock = threading.Lock()
 
     @property
     def translator(self) -> TranslatorProtocol:
@@ -723,6 +739,160 @@ class CCTranslationApp:
             translator = self._translator
         assert translator is not None  # For type checkers
         return translator
+
+    def _register_copy_hotkeys(self) -> None:
+        self._refresh_copy_hotkey()
+        self._register_ime_toggle_workaround()
+        self._install_keyboard_debug_hook()
+
+    def _register_ime_toggle_workaround(self) -> None:
+        if self._ime_hotkeys_registered:
+            return
+        if sys.platform != "win32":
+            return
+        if _winkeyboard is None:
+            return
+
+        def ensure_altgr_released() -> None:
+            if _winkeyboard is None:  # pragma: no cover - defensive guard
+                return
+            _winkeyboard.altgr_is_pressed = False
+            _winkeyboard.ignore_next_right_alt = False
+            if self._debug_keyboard:
+                print(
+                    "[keyboard-debug] IME toggle hotkey detected -> altgr_is_pressed=False, "
+                    "ignore_next_right_alt=False",
+                    flush=True,
+                )
+            self._refresh_copy_hotkey()
+
+        registered_any = False
+        for key_name in ("ime hangul mode", "ime kanji mode"):
+            try:
+                self._keyboard.add_hotkey(key_name, ensure_altgr_released, suppress=False)
+            except Exception:  # pragma: no cover - hotkey name unsupported
+                continue
+            else:
+                registered_any = True
+
+        if not registered_any:
+            fallback_names = {"ime hangul mode", "ime kanji mode", "半角/全角"}
+            fallback_scan_codes = {41}
+
+            def ime_fallback_hook(event: object) -> None:
+                try:
+                    event_type = getattr(event, "event_type", None)
+                    if event_type != "down":
+                        return
+                    name = getattr(event, "name", None)
+                    scan_code = getattr(event, "scan_code", None)
+                except Exception:
+                    return
+
+                if name in fallback_names or scan_code in fallback_scan_codes:
+                    ensure_altgr_released()
+
+            try:
+                self._keyboard.hook(ime_fallback_hook)  # type: ignore[attr-defined]
+            except Exception:  # pragma: no cover - hook may be unavailable
+                pass
+            else:
+                self._ime_fallback_hook = ime_fallback_hook
+                registered_any = True
+
+        if registered_any:
+            self._ime_hotkeys_registered = True
+
+    def _install_keyboard_debug_hook(self) -> None:
+        if not self._debug_keyboard:
+            return
+        if self._keyboard_debug_hook is not None:
+            return
+
+        def log_event(event: object) -> None:
+            try:
+                event_type = getattr(event, "event_type", None)
+                name = getattr(event, "name", None)
+                scan_code = getattr(event, "scan_code", None)
+                is_keypad = getattr(event, "is_keypad", None)
+                event_time = getattr(event, "time", None)
+                pressed_keys: list[str] = []
+                for key_name in (
+                    "left ctrl",
+                    "right ctrl",
+                    "left alt",
+                    "right alt",
+                    "alt",
+                    "alt gr",
+                    "ctrl",
+                    "shift",
+                    "ime hangul mode",
+                    "ime kanji mode",
+                ):
+                    try:
+                        if self._keyboard.is_pressed(key_name):  # type: ignore[attr-defined]
+                            pressed_keys.append(key_name)
+                    except Exception:
+                        continue
+
+                altgr_state = None
+                if sys.platform == "win32" and _winkeyboard is not None:
+                    altgr_state = {
+                        "altgr_is_pressed": getattr(_winkeyboard, "altgr_is_pressed", None),
+                        "ignore_next_right_alt": getattr(
+                            _winkeyboard, "ignore_next_right_alt", None
+                        ),
+                    }
+
+                print(
+                    (
+                        "[keyboard-debug] event_type=%s name=%s scan_code=%s is_keypad=%s "
+                        "time=%s pressed=%s altgr_state=%s"
+                    )
+                    % (
+                        event_type,
+                        name,
+                        scan_code,
+                        is_keypad,
+                        event_time,
+                        pressed_keys,
+                        altgr_state,
+                    ),
+                    flush=True,
+                )
+            except Exception as exc:  # pragma: no cover - defensive against hook failures
+                print(f"[keyboard-debug] failed to log keyboard event: {exc}", flush=True)
+
+        try:
+            self._keyboard.hook(log_event)  # type: ignore[attr-defined]
+        except Exception as exc:  # pragma: no cover - hook may be unavailable
+            print(f"[keyboard-debug] failed to install hook: {exc}", flush=True)
+            return
+
+        self._keyboard_debug_hook = log_event
+
+    def _refresh_copy_hotkey(self) -> None:
+        with self._hotkey_lock:
+            handle = self._copy_hotkey_handle
+            if handle is not None:
+                try:
+                    self._keyboard.remove_hotkey(handle)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                finally:
+                    self._copy_hotkey_handle = None
+
+            try:
+                self._copy_hotkey_handle = self._keyboard.add_hotkey(
+                    "ctrl+c", self._handle_copy_event, suppress=False
+                )
+            except Exception as exc:
+                self._copy_hotkey_handle = None
+                if self._debug_keyboard:
+                    print(
+                        f"[keyboard-debug] failed to register copy hotkey: {exc}",
+                        flush=True,
+                    )
 
     def _reset_translator(self) -> None:
         with self._translator_lock:
@@ -738,7 +908,9 @@ class CCTranslationApp:
             self._worker_thread.start()
 
         while True:
-            self._keyboard.add_hotkey("ctrl+c", self._handle_copy_event, suppress=False)
+            self._ime_hotkeys_registered = False
+            self._ime_fallback_hook = None
+            self._register_copy_hotkeys()
 
             print(
                 "CCTranslationTool is running. Double press Ctrl+C on selected text to translate."
@@ -752,6 +924,8 @@ class CCTranslationApp:
                 self.stop()
             finally:
                 self._keyboard.unhook_all()
+                with self._hotkey_lock:
+                    self._copy_hotkey_handle = None
                 if self._tray_controller is not None:
                     self._tray_controller.stop()
 
@@ -906,6 +1080,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Source language. Leave empty to auto-detect.",
     )
+    parser.add_argument(
+        "--debug-keys",
+        action="store_true",
+        help="Log raw keyboard events and IME toggle workaround state for troubleshooting.",
+    )
     return parser.parse_args()
 
 
@@ -914,7 +1093,11 @@ def main() -> None:
         with SingleInstanceGuard("cctranslationtool"):
             args = parse_args()
             _save_dest_language(args.dest)
-            app = CCTranslationApp(dest_language=args.dest, source_language=args.src)
+            app = CCTranslationApp(
+                dest_language=args.dest,
+                source_language=args.src,
+                debug_keyboard=args.debug_keys,
+            )
             tray_controller = SystemTrayController(app)
             app.start(tray_controller=tray_controller)
     except SingleInstanceError:
