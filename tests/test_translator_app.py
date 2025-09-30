@@ -1,12 +1,9 @@
-import io
 import queue
 import threading
 import sys
-import threading
 import types
 import unittest
 import unittest.mock as mock
-from contextlib import redirect_stdout
 from types import SimpleNamespace
 
 if "pystray" not in sys.modules:
@@ -54,21 +51,6 @@ class FakeClipboard:
         return self.text
 
 
-class FakeKeyboard:
-    def __init__(self) -> None:
-        self.registered = []
-        self.unhooked = False
-
-    def add_hotkey(self, *args, **kwargs):  # pragma: no cover - only used in manual runs
-        self.registered.append((args, kwargs))
-
-    def wait(self):  # pragma: no cover - only used in manual runs
-        raise RuntimeError("wait should not be called during tests")
-
-    def unhook_all(self):  # pragma: no cover - only used in manual runs
-        self.unhooked = True
-
-
 class FakeTranslator:
     def __init__(self, translated: str = "こんにちは", detected: str = "en") -> None:
         self.calls = []
@@ -94,11 +76,12 @@ class CCTranslationAppTestMixin:
             dest_language="ja",
             source_language=None,
             translator_factory=lambda: FakeTranslator(),
-            keyboard_module=FakeKeyboard(),
             clipboard_module=FakeClipboard("hello"),
             time_provider=fake_time.now,
             display_callback=lambda original, translated, detected: None,
             double_copy_interval=0.5,
+            min_trigger_interval=0.0,
+            hotkey_bindings=[],
         )
         defaults.update(overrides)
         app = CCTranslationApp(**defaults)
@@ -213,14 +196,13 @@ class CCTranslationAppTests(CCTranslationAppTestMixin, unittest.TestCase):
         clipboard = LockedClipboard()
         app = self._create_app(clipboard_module=clipboard)
 
-        buffer = io.StringIO()
-        with redirect_stdout(buffer):
+        with self.assertLogs("cctranslationtool.hotkeys", level="ERROR") as captured:
             app._handle_copy_event()
             app._fake_time.advance(0.1)
             app._handle_copy_event()
 
         self.assertTrue(app._request_queue.empty())
-        self.assertIn("clipboard", buffer.getvalue().lower())
+        self.assertTrue(any("clipboard" in message.lower() for message in captured.output))
 
         clipboard.locked = False
         app._fake_time.advance(0.1)
