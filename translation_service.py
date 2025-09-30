@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -45,6 +46,8 @@ class GoogleTranslateClient:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 payload = response.read()
+        except socket.timeout as exc:  # pragma: no cover - depends on network
+            raise TranslationError("Translation request timed out") from exc
         except urllib.error.URLError as exc:  # pragma: no cover - network errors are runtime issues
             raise TranslationError("Network error while contacting Google Translate") from exc
 
