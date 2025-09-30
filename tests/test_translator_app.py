@@ -200,6 +200,34 @@ class CCTranslationAppTests(CCTranslationAppTestMixin, unittest.TestCase):
         self.assertEqual(translator.calls, [("hello", None, "ja")])
         self.assertEqual(captured, [("hello", "translated", "en")])
 
+    def test_collect_runtime_status_defaults(self):
+        app = self._create_app()
+        status = app._collect_runtime_status()
+
+        self.assertFalse(status["worker_alive"])
+        self.assertIsNone(status["worker_thread_name"])
+        self.assertEqual(status["queue_size"], 0)
+        self.assertEqual(status["pending_copy"], 0)
+        self.assertEqual(status["last_interval"], 0.0)
+        self.assertTrue(status["listener_state"])
+        self.assertIsNone(status["listener_thread_alive"])
+        self.assertFalse(status["monitor_alive"])
+        self.assertFalse(status["hotkeys_active"])
+        self.assertIsNone(status["failure_count"])
+        self.assertIsNone(status["last_copy_age"])
+
+    def test_collect_runtime_status_with_known_listener_state(self):
+        app = self._create_app()
+        app._fake_time.advance(5.0)
+        app._last_copy_timestamp = app._fake_time.now() - 1.5
+
+        status = app._collect_runtime_status(known_listener_state=False, failure_count=3)
+
+        self.assertFalse(status["listener_state"])
+        self.assertEqual(status["failure_count"], 3)
+        self.assertAlmostEqual(status["last_copy_age"], 1.5)
+        self.assertEqual(app._last_keyboard_listener_state, False)
+
     def test_process_single_request_handles_errors(self):
         captured = []
 

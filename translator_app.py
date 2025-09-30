@@ -751,6 +751,7 @@ class CCTranslationApp:
         self._last_copy_timestamp: float = 0.0
         self._last_keyboard_listener_state: Optional[bool] = None
         self._last_keyboard_status_log: float = 0.0
+        self._worker_failure_logged = False
 
     @property
     def translator(self) -> TranslatorProtocol:
@@ -864,6 +865,56 @@ class CCTranslationApp:
                 return None
         return None
 
+    def _collect_runtime_status(
+        self,
+        *,
+        known_listener_state: Optional[bool] = None,
+        failure_count: Optional[int] = None,
+    ) -> dict[str, object]:
+        worker_thread = self._worker_thread if self._worker_thread else None
+        worker_alive = bool(worker_thread and worker_thread.is_alive())
+        worker_name = worker_thread.name if worker_thread is not None else None
+        try:
+            queue_size = self._request_queue.qsize()
+        except NotImplementedError:  # pragma: no cover - platform dependent guard
+            queue_size = None
+        with self._lock:
+            pending_copy = self._copy_detector.pending_count
+            last_interval = self._copy_detector.last_interval
+            last_copy_timestamp = self._last_copy_timestamp
+        if known_listener_state is None:
+            listener_state = self._get_keyboard_listener_state()
+        else:
+            listener_state = known_listener_state
+            self._last_keyboard_listener_state = known_listener_state
+        listener_thread_alive = self._get_keyboard_listener_thread_alive()
+        monitor_alive = (
+            self._keyboard_monitor_thread.is_alive()
+            if self._keyboard_monitor_thread
+            else False
+        )
+        hotkeys_active = self._hotkeys_active.is_set()
+        last_copy_age = (
+            self._time_provider() - last_copy_timestamp
+            if last_copy_timestamp
+            else None
+        )
+        status = {
+            "worker_alive": worker_alive,
+            "worker_thread_name": worker_name,
+            "queue_size": queue_size,
+            "pending_copy": pending_copy,
+            "last_interval": last_interval,
+            "last_copy_timestamp": last_copy_timestamp or None,
+            "last_copy_age": last_copy_age,
+            "listener_state": listener_state,
+            "listener_thread_alive": listener_thread_alive,
+            "monitor_alive": monitor_alive,
+            "hotkeys_active": hotkeys_active,
+            "failure_count": failure_count,
+        }
+        return status
+
     def _log_keyboard_status(
         self, listener_state: Optional[bool], failure_count: int
     ) -> None:
@@ -871,26 +922,37 @@ class CCTranslationApp:
         if now - self._last_keyboard_status_log < 10.0:
             return
         self._last_keyboard_status_log = now
-        hotkeys_active = self._hotkeys_active.is_set()
-        monitor_alive = (
-            self._keyboard_monitor_thread.is_alive()
-            if self._keyboard_monitor_thread
-            else False
+        status = self._collect_runtime_status(
+            known_listener_state=listener_state, failure_count=failure_count
         )
-        listener_thread_alive = self._get_keyboard_listener_thread_alive()
-        last_copy_age = None
-        if self._last_copy_timestamp:
-            last_copy_age = now - self._last_copy_timestamp
+        last_copy_age = status["last_copy_age"]
+        queue_size = status["queue_size"]
         logger.info(
-            "Keyboard permission status: hotkeys_active=%s, listener_state=%s, listener_thread_alive=%s, monitor_alive=%s, failure_count=%d, hotkey_handles=%d, last_copy_age=%s",
-            hotkeys_active,
-            listener_state,
-            listener_thread_alive,
-            monitor_alive,
+            "Keyboard permission status: hotkeys_active=%s, listener_state=%s, listener_thread_alive=%s, monitor_alive=%s, failure_count=%d, hotkey_handles=%d, worker_alive=%s, worker_thread=%s, queue_size=%s, pending_copy=%d, interval=%.3f, last_copy_age=%s",
+            status["hotkeys_active"],
+            status["listener_state"],
+            status["listener_thread_alive"],
+            status["monitor_alive"],
             failure_count,
             len(self._hotkey_handles),
+            status["worker_alive"],
+            status["worker_thread_name"],
+            "unknown" if queue_size is None else queue_size,
+            status["pending_copy"],
+            status["last_interval"],
             None if last_copy_age is None else f"{last_copy_age:.3f}",
         )
+        if not status["worker_alive"]:
+            if not self._worker_failure_logged:
+                logger.warning(
+                    "Worker thread not alive (thread=%s, queue_size=%s, pending_copy=%d)",
+                    status["worker_thread_name"],
+                    "unknown" if queue_size is None else queue_size,
+                    status["pending_copy"],
+                )
+                self._worker_failure_logged = True
+        else:
+            self._worker_failure_logged = False
 
     def start(self, *, tray_controller: Optional[SystemTrayController] = None) -> None:
         """Start listening for keyboard events and processing translations."""
@@ -1112,71 +1174,42 @@ class CCTranslationApp:
         )
 
     def _log_hotkey_heartbeat(self) -> None:
-        worker_alive = self._worker_thread.is_alive() if self._worker_thread else False
-        queue_size = self._request_queue.qsize()
-        with self._lock:
-            pending_copy = self._copy_detector.pending_count
-            last_interval = self._copy_detector.last_interval
-            last_copy_timestamp = self._last_copy_timestamp
-        listener_state = self._get_keyboard_listener_state()
-        monitor_alive = (
-            self._keyboard_monitor_thread.is_alive()
-            if self._keyboard_monitor_thread
-            else False
-        )
-        listener_thread_alive = self._get_keyboard_listener_thread_alive()
-        last_copy_age = (
-            self._time_provider() - last_copy_timestamp
-            if last_copy_timestamp
-            else None
-        )
+        status = self._collect_runtime_status()
+        queue_size = status["queue_size"]
+        last_copy_age = status["last_copy_age"]
         logger.info(
             "Hotkey heartbeat triggered (worker_alive=%s, queue_size=%d, pending_copy=%d, interval=%.3f, listener_active=%s, listener_thread_alive=%s, monitor_alive=%s, last_copy_age=%s)",
-            worker_alive,
-            queue_size,
-            pending_copy,
-            last_interval,
-            listener_state,
-            listener_thread_alive,
-            monitor_alive,
+            status["worker_alive"],
+            -1 if queue_size is None else queue_size,
+            status["pending_copy"],
+            status["last_interval"],
+            status["listener_state"],
+            status["listener_thread_alive"],
+            status["monitor_alive"],
             None if last_copy_age is None else f"{last_copy_age:.3f}",
         )
 
     def _dump_diagnostics(self) -> None:
-        worker_alive = self._worker_thread.is_alive() if self._worker_thread else False
-        queue_size = self._request_queue.qsize()
+        status = self._collect_runtime_status()
+        queue_size = status["queue_size"]
         threads = ", ".join(
             f"{thread.name}(alive={thread.is_alive()})" for thread in threading.enumerate()
         )
-        with self._lock:
-            pending_copy = self._copy_detector.pending_count
-            last_interval = self._copy_detector.last_interval
-            last_copy_timestamp = self._last_copy_timestamp
-        listener_state = self._get_keyboard_listener_state()
-        monitor_alive = (
-            self._keyboard_monitor_thread.is_alive()
-            if self._keyboard_monitor_thread
-            else False
-        )
-        listener_thread_alive = self._get_keyboard_listener_thread_alive()
-        last_copy_age = (
-            self._time_provider() - last_copy_timestamp
-            if last_copy_timestamp
-            else None
-        )
         logger.info(
             "Diagnostics dump: worker_alive=%s, queue_size=%d, pending_copy=%d, interval=%.3f, restart=%s, stop=%s, listener_active=%s, listener_thread_alive=%s, monitor_alive=%s, hotkeys_active=%s, last_copy_age=%s, threads=[%s]",
-            worker_alive,
-            queue_size,
-            pending_copy,
-            last_interval,
+            status["worker_alive"],
+            -1 if queue_size is None else queue_size,
+            status["pending_copy"],
+            status["last_interval"],
             self._restart_event.is_set(),
             self._stop_event.is_set(),
-            listener_state,
-            listener_thread_alive,
-            monitor_alive,
+            status["listener_state"],
+            status["listener_thread_alive"],
+            status["monitor_alive"],
             self._hotkeys_active.is_set(),
-            None if last_copy_age is None else f"{last_copy_age:.3f}",
+            None
+            if status["last_copy_age"] is None
+            else f"{status['last_copy_age']:.3f}",
             threads,
         )
 
