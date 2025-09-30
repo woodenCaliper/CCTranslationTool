@@ -166,6 +166,80 @@ class DoubleCopyDetector:
         return self._last_time
 
 
+@dataclass
+class KeyboardEventRecorder:
+    """Record key events observed by the ``keyboard`` hook for diagnostics."""
+
+    keyboard_module: object
+    time_provider: Callable[[], float]
+    tracked_keys: tuple[str, ...] = ("ctrl", "left ctrl", "right ctrl", "c")
+    _hook: Optional[Callable[[object], None]] = field(default=None, init=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+    _last_events: dict[str, float] = field(default_factory=dict, init=False)
+    _total_events: int = field(default=0, init=False)
+
+    def start(self) -> None:
+        """Begin recording keyboard events if the module supports hooks."""
+
+        if self._hook is not None:
+            return
+        hook = getattr(self.keyboard_module, "hook", None)
+        if callable(hook):
+            self._hook = hook(self._handle_event)
+
+    def stop(self) -> None:
+        """Stop recording events and release the hook."""
+
+        if self._hook is None:
+            return
+        unhook = getattr(self.keyboard_module, "unhook", None)
+        if callable(unhook):
+            try:
+                unhook(self._hook)
+            except Exception:  # pragma: no cover - defensive cleanup
+                logger.exception("Failed to unhook keyboard event recorder")
+        self._hook = None
+
+    def _handle_event(self, event: object) -> None:
+        name = getattr(event, "name", None)
+        if not isinstance(name, str):
+            return
+        normalized = name.lower()
+        if normalized not in self.tracked_keys:
+            return
+        timestamp = self.time_provider()
+        with self._lock:
+            self._last_events[normalized] = timestamp
+            self._last_events["__last__"] = timestamp
+            self._total_events += 1
+
+    def snapshot(self) -> dict[str, object]:
+        """Return ages of the most recent tracked events for logging."""
+
+        now = self.time_provider()
+        with self._lock:
+            last_ctrl_time = max(
+                (
+                    self._last_events[key]
+                    for key in ("ctrl", "left ctrl", "right ctrl")
+                    if key in self._last_events
+                ),
+                default=None,
+            )
+            last_c_time = self._last_events.get("c")
+            last_event_time = self._last_events.get("__last__")
+            total_events = self._total_events
+        def _age(value: Optional[float]) -> Optional[float]:
+            return None if value is None else max(0.0, now - value)
+
+        return {
+            "last_ctrl_age": _age(last_ctrl_time),
+            "last_c_age": _age(last_c_time),
+            "last_event_age": _age(last_event_time),
+            "total_events": total_events,
+        }
+
+
 class SingleInstanceError(RuntimeError):
     """Raised when another instance of the application is already running."""
 
@@ -709,6 +783,7 @@ class CCTranslationApp:
         time_provider: Callable[[], float] = time.time,
         display_callback: Optional[Callable[[str, str, Optional[str]], None]] = None,
         double_copy_interval: float = DOUBLE_COPY_INTERVAL,
+        debug_key_events: bool = False,
     ) -> None:
         self.dest_language = dest_language
         self.source_language = source_language
@@ -752,6 +827,11 @@ class CCTranslationApp:
         self._last_keyboard_listener_state: Optional[bool] = None
         self._last_keyboard_status_log: float = 0.0
         self._worker_failure_logged = False
+        self._key_event_recorder = (
+            KeyboardEventRecorder(self._keyboard, self._time_provider)
+            if debug_key_events
+            else None
+        )
 
     @property
     def translator(self) -> TranslatorProtocol:
@@ -779,6 +859,9 @@ class CCTranslationApp:
             )
             self._hotkey_handles["diagnostics"] = self._keyboard.add_hotkey(
                 "ctrl+shift+d", self._dump_diagnostics, suppress=False
+            )
+            self._hotkey_handles["key_events"] = self._keyboard.add_hotkey(
+                "ctrl+shift+e", self._log_key_event_snapshot, suppress=False
             )
             self._hotkeys_active.set()
 
@@ -912,6 +995,11 @@ class CCTranslationApp:
             "monitor_alive": monitor_alive,
             "hotkeys_active": hotkeys_active,
             "failure_count": failure_count,
+            "key_event_stats": (
+                self._key_event_recorder.snapshot()
+                if self._key_event_recorder is not None
+                else None
+            ),
         }
         return status
 
@@ -942,6 +1030,11 @@ class CCTranslationApp:
             status["last_interval"],
             None if last_copy_age is None else f"{last_copy_age:.3f}",
         )
+        if status["key_event_stats"] is not None:
+            logger.info(
+                "Keyboard low-level events: %s",
+                self._format_key_event_stats(status["key_event_stats"]),
+            )
         if not status["worker_alive"]:
             if not self._worker_failure_logged:
                 logger.warning(
@@ -973,6 +1066,9 @@ class CCTranslationApp:
                 self._worker_thread.is_alive(),
             )
 
+        if self._key_event_recorder is not None:
+            self._key_event_recorder.start()
+
         while True:
             self._start_keyboard_monitor()
             self._register_hotkeys(force=True)
@@ -1002,6 +1098,8 @@ class CCTranslationApp:
             break
 
         self._stop_keyboard_monitor()
+        if self._key_event_recorder is not None:
+            self._key_event_recorder.stop()
 
     def stop(self) -> None:
         """Signal the application to shut down."""
@@ -1188,6 +1286,41 @@ class CCTranslationApp:
             status["monitor_alive"],
             None if last_copy_age is None else f"{last_copy_age:.3f}",
         )
+        if status["key_event_stats"] is not None:
+            logger.info(
+                "Keyboard low-level events: %s",
+                self._format_key_event_stats(status["key_event_stats"]),
+            )
+
+    def _format_key_event_stats(self, stats: Optional[dict[str, object]]) -> str:
+        if not stats:
+            return "disabled"
+
+        def _fmt(value: object) -> str:
+            if value is None:
+                return "None"
+            if isinstance(value, (int, float)):
+                if isinstance(value, int):
+                    return str(value)
+                return f"{value:.3f}"
+            return str(value)
+
+        return (
+            "events={events}, last_ctrl={last_ctrl}, last_c={last_c}, last_event={last_event}".format(
+                events=_fmt(stats.get("total_events")),
+                last_ctrl=_fmt(stats.get("last_ctrl_age")),
+                last_c=_fmt(stats.get("last_c_age")),
+                last_event=_fmt(stats.get("last_event_age")),
+            )
+        )
+
+    def _log_key_event_snapshot(self) -> None:
+        stats = (
+            self._key_event_recorder.snapshot()
+            if self._key_event_recorder is not None
+            else None
+        )
+        logger.info("Keyboard event snapshot: %s", self._format_key_event_stats(stats))
 
     def _dump_diagnostics(self) -> None:
         status = self._collect_runtime_status()
@@ -1212,6 +1345,11 @@ class CCTranslationApp:
             else f"{status['last_copy_age']:.3f}",
             threads,
         )
+        if status["key_event_stats"] is not None:
+            logger.info(
+                "Keyboard low-level events: %s",
+                self._format_key_event_stats(status["key_event_stats"]),
+            )
 
 
 def parse_args() -> argparse.Namespace:
@@ -1226,6 +1364,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Source language. Leave empty to auto-detect.",
     )
+    parser.add_argument(
+        "--debug-key-events",
+        action="store_true",
+        help="Log recent Ctrl/C key event timings seen by the keyboard hook.",
+    )
     return parser.parse_args()
 
 
@@ -1238,7 +1381,11 @@ def main() -> None:
         with SingleInstanceGuard("cctranslationtool"):
             args = parse_args()
             _save_dest_language(args.dest)
-            app = CCTranslationApp(dest_language=args.dest, source_language=args.src)
+            app = CCTranslationApp(
+                dest_language=args.dest,
+                source_language=args.src,
+                debug_key_events=args.debug_key_events,
+            )
             tray_controller = SystemTrayController(app)
             app.start(tray_controller=tray_controller)
     except SingleInstanceError:

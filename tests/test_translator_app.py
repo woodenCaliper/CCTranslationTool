@@ -8,6 +8,7 @@ import unittest
 import unittest.mock as mock
 from contextlib import redirect_stdout
 from types import SimpleNamespace
+from typing import Callable
 
 if "pystray" not in sys.modules:
     stub_pystray = types.ModuleType("pystray")
@@ -71,6 +72,7 @@ class FakeKeyboard:
         self.removed: list[int] = []
         self._next_handle = 1
         self._listener = FakeKeyboard.Listener()
+        self._hooks: list[Callable[[object], None]] = []
 
     def add_hotkey(self, *args, **kwargs):  # pragma: no cover - only used in manual runs
         handle = self._next_handle
@@ -82,6 +84,19 @@ class FakeKeyboard:
     def remove_hotkey(self, handle: int) -> None:  # pragma: no cover - only used in manual runs
         self._handles.pop(handle, None)
         self.removed.append(handle)
+
+    def hook(self, callback):  # pragma: no cover - tests enable explicitly
+        self._hooks.append(callback)
+        return callback
+
+    def unhook(self, callback):  # pragma: no cover - tests enable explicitly
+        if callback in self._hooks:
+            self._hooks.remove(callback)
+
+    def emit(self, event_name: str) -> None:
+        event = SimpleNamespace(name=event_name)
+        for callback in list(self._hooks):
+            callback(event)
 
     def wait(self):  # pragma: no cover - only used in manual runs
         raise RuntimeError("wait should not be called during tests")
@@ -215,6 +230,7 @@ class CCTranslationAppTests(CCTranslationAppTestMixin, unittest.TestCase):
         self.assertFalse(status["hotkeys_active"])
         self.assertIsNone(status["failure_count"])
         self.assertIsNone(status["last_copy_age"])
+        self.assertIsNone(status["key_event_stats"])
 
     def test_collect_runtime_status_with_known_listener_state(self):
         app = self._create_app()
@@ -227,6 +243,26 @@ class CCTranslationAppTests(CCTranslationAppTestMixin, unittest.TestCase):
         self.assertEqual(status["failure_count"], 3)
         self.assertAlmostEqual(status["last_copy_age"], 1.5)
         self.assertEqual(app._last_keyboard_listener_state, False)
+
+    def test_key_event_recorder_snapshot(self):
+        app = self._create_app(debug_key_events=True)
+        recorder = app._key_event_recorder
+        self.assertIsNotNone(recorder)
+        assert recorder is not None
+        recorder.start()
+        app._keyboard.emit("c")
+        app._fake_time.advance(0.2)
+        app._keyboard.emit("ctrl")
+        stats = recorder.snapshot()
+        self.assertEqual(stats["total_events"], 2)
+        self.assertIsNotNone(stats["last_c_age"])
+        recorder.stop()
+
+    def test_key_event_snapshot_logging(self):
+        app = self._create_app(debug_key_events=True)
+        with mock.patch("translator_app.logger.info") as info_mock:
+            app._log_key_event_snapshot()
+        info_mock.assert_called()
 
     def test_process_single_request_handles_errors(self):
         captured = []
