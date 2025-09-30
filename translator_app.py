@@ -714,6 +714,12 @@ class CCTranslationApp:
         self._tray_controller: Optional[SystemTrayController] = None
         self._language_options = list(LANGUAGE_SEQUENCE)
         self._last_original_text: Optional[str] = None
+        self._hotkey_lock = threading.Lock()
+        self._copy_hotkey_handle: Optional[object] = None
+        self._ime_toggle_handle: Optional[object] = None
+        self._ime_fallback_hook: Optional[object] = None
+        self._ime_fallback_callback: Optional[Callable[[object], None]] = None
+        self._altgr_pressed = False
 
     @property
     def translator(self) -> TranslatorProtocol:
@@ -738,7 +744,8 @@ class CCTranslationApp:
             self._worker_thread.start()
 
         while True:
-            self._keyboard.add_hotkey("ctrl+c", self._handle_copy_event, suppress=False)
+            self._refresh_copy_hotkey()
+            self._register_ime_toggle_workaround()
 
             print(
                 "CCTranslationTool is running. Double press Ctrl+C on selected text to translate."
@@ -752,6 +759,11 @@ class CCTranslationApp:
                 self.stop()
             finally:
                 self._keyboard.unhook_all()
+                with self._hotkey_lock:
+                    self._copy_hotkey_handle = None
+                    self._ime_toggle_handle = None
+                    self._ime_fallback_hook = None
+                    self._ime_fallback_callback = None
                 if self._tray_controller is not None:
                     self._tray_controller.stop()
 
@@ -892,6 +904,100 @@ class CCTranslationApp:
         self._request_queue.put(
             TranslationRequest(text=text, src=src, dest=dest, reposition=False)
         )
+
+    def _refresh_copy_hotkey(self) -> None:
+        with self._hotkey_lock:
+            handle = self._copy_hotkey_handle
+            if handle is not None and hasattr(self._keyboard, "remove_hotkey"):
+                try:
+                    self._keyboard.remove_hotkey(handle)
+                except Exception:
+                    pass
+                finally:
+                    self._copy_hotkey_handle = None
+
+        new_handle = self._keyboard.add_hotkey(
+            "ctrl+c", self._handle_copy_event, suppress=False
+        )
+        with self._hotkey_lock:
+            self._copy_hotkey_handle = new_handle
+
+    def _handle_ime_toggle_event(self) -> None:
+        with self._hotkey_lock:
+            self._altgr_pressed = False
+        self._refresh_copy_hotkey()
+
+    def _register_ime_toggle_workaround(self) -> None:
+        def remove_existing_fallback() -> None:
+            previous = self._ime_fallback_hook
+            callback = self._ime_fallback_callback
+            if previous is None and callback is None:
+                return
+            try:
+                if previous is not None and hasattr(self._keyboard, "unhook"):
+                    self._keyboard.unhook(previous)
+                elif callback is not None and hasattr(self._keyboard, "unhook"):
+                    self._keyboard.unhook(callback)
+            except Exception:
+                pass
+            finally:
+                with self._hotkey_lock:
+                    self._ime_fallback_hook = None
+                    self._ime_fallback_callback = None
+
+        with self._hotkey_lock:
+            handle = self._ime_toggle_handle
+        if handle is not None and hasattr(self._keyboard, "remove_hotkey"):
+            try:
+                self._keyboard.remove_hotkey(handle)
+            except Exception:
+                pass
+            finally:
+                with self._hotkey_lock:
+                    self._ime_toggle_handle = None
+
+        remove_existing_fallback()
+
+        try:
+            ime_handle = self._keyboard.add_hotkey(
+                "ime kanji mode", self._handle_ime_toggle_event, suppress=False
+            )
+        except Exception:
+            ime_handle = None
+        with self._hotkey_lock:
+            self._ime_toggle_handle = ime_handle
+
+        fallback_registered = False
+
+        def fallback_handler(event: object) -> None:
+            name = getattr(event, "name", None)
+            scan_code = getattr(event, "scan_code", None)
+            if name == "半角/全角" or scan_code == 41:
+                self._handle_ime_toggle_event()
+
+        try:
+            hook_handle = self._keyboard.hook(fallback_handler)
+            fallback_registered = True
+        except AttributeError:
+            try:
+                hook_handle = self._keyboard.hook_key(
+                    "半角/全角", lambda _: self._handle_ime_toggle_event(), suppress=False
+                )
+                fallback_registered = True
+            except AttributeError:
+                hook_handle = None
+            except Exception:
+                hook_handle = None
+        except Exception:
+            hook_handle = None
+
+        with self._hotkey_lock:
+            if fallback_registered:
+                self._ime_fallback_hook = hook_handle if hook_handle is not None else fallback_handler
+                self._ime_fallback_callback = fallback_handler
+            else:
+                self._ime_fallback_hook = None
+                self._ime_fallback_callback = None
 
 
 def parse_args() -> argparse.Namespace:
