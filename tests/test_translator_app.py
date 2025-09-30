@@ -346,6 +346,34 @@ class CCTranslationAppTests(CCTranslationAppTestMixin, unittest.TestCase):
         self.assertFalse(fake_state.altgr_is_pressed)
         self.assertFalse(fake_state.ignore_next_right_alt)
 
+    def test_ime_toggle_fallback_hook_resets_altgr_state(self):
+        class FallbackImeKeyboard(RecordingKeyboard):
+            def add_hotkey(self, combo, callback, suppress=False):  # type: ignore[override]
+                if combo in ("ime hangul mode", "ime kanji mode"):
+                    raise RuntimeError("unsupported hotkey")
+                return super().add_hotkey(combo, callback, suppress=suppress)
+
+        keyboard = FallbackImeKeyboard()
+        app = self._create_app(keyboard_module=keyboard)
+        fake_state = types.SimpleNamespace(altgr_is_pressed=True, ignore_next_right_alt=True)
+
+        with mock.patch.object(translator_app, "_winkeyboard", fake_state), mock.patch(
+            "translator_app.sys.platform", "win32"
+        ):
+            app._register_copy_hotkeys()
+            self.assertGreaterEqual(len(keyboard.hooks), 1)
+            event = types.SimpleNamespace(
+                event_type="down",
+                name="半角/全角",
+                scan_code=41,
+                is_keypad=False,
+                time=1.23,
+            )
+            keyboard.simulate_event(event)
+
+        self.assertFalse(fake_state.altgr_is_pressed)
+        self.assertFalse(fake_state.ignore_next_right_alt)
+
     def test_debug_keyboard_hook_logs_events(self):
         keyboard = RecordingKeyboard()
         fake_state = types.SimpleNamespace(altgr_is_pressed=True, ignore_next_right_alt=True)

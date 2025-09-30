@@ -727,6 +727,7 @@ class CCTranslationApp:
         self._ime_hotkeys_registered = False
         self._debug_keyboard = debug_keyboard
         self._keyboard_debug_hook: Optional[Callable[[object], None]] = None
+        self._ime_fallback_hook: Optional[Callable[[object], None]] = None
 
     @property
     def translator(self) -> TranslatorProtocol:
@@ -770,6 +771,32 @@ class CCTranslationApp:
                 continue
             else:
                 registered_any = True
+
+        if not registered_any:
+            fallback_names = {"ime hangul mode", "ime kanji mode", "半角/全角"}
+            fallback_scan_codes = {41}
+
+            def ime_fallback_hook(event: object) -> None:
+                try:
+                    event_type = getattr(event, "event_type", None)
+                    if event_type != "down":
+                        return
+                    name = getattr(event, "name", None)
+                    scan_code = getattr(event, "scan_code", None)
+                except Exception:
+                    return
+
+                if name in fallback_names or scan_code in fallback_scan_codes:
+                    ensure_altgr_released()
+
+            try:
+                self._keyboard.hook(ime_fallback_hook)  # type: ignore[attr-defined]
+            except Exception:  # pragma: no cover - hook may be unavailable
+                pass
+            else:
+                self._ime_fallback_hook = ime_fallback_hook
+                registered_any = True
+
         if registered_any:
             self._ime_hotkeys_registered = True
 
@@ -856,6 +883,7 @@ class CCTranslationApp:
 
         while True:
             self._ime_hotkeys_registered = False
+            self._ime_fallback_hook = None
             self._register_copy_hotkeys()
 
             print(
