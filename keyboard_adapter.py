@@ -8,6 +8,13 @@ import time
 from typing import Callable, Dict, Optional, Tuple
 
 try:
+    import win32api  # type: ignore
+    import win32con  # type: ignore
+except Exception:  # pragma: no cover - optional dependency on non-Windows platforms
+    win32api = None  # type: ignore
+    win32con = None  # type: ignore
+
+try:
     import pyWinhook  # type: ignore
 except Exception:  # pragma: no cover - optional dependency on non-Windows platforms
     pyWinhook = None  # type: ignore
@@ -39,20 +46,21 @@ class PyWinhookKeyboardAdapter:
         if pyWinhook is None or pythoncom is None:  # pragma: no cover - guarded by factory
             raise RuntimeError("pyWinhook is not available")
 
-        self._hook_manager = pyWinhook.HookManager()
-        self._hook_manager.KeyDown = self._on_key_down
-        self._hook_manager.KeyUp = self._on_key_up
-        self._hook_manager.HookKeyboard()
-
         self._stop_event = threading.Event()
         self._pressed: Dict[str, int] = {}
         self._callbacks: Dict[Hotkey, Callback] = {}
         self._lock = threading.Lock()
+        self._ready_event = threading.Event()
+        self._thread_id: Optional[int] = None
+        self._hook_manager: Optional["pyWinhook.HookManager"] = None
 
         self._pump_thread = threading.Thread(
-            target=self._pump_messages, name="PyWinhookKeyboard", daemon=True
+            target=self._run_message_loop, name="PyWinhookKeyboard", daemon=True
         )
         self._pump_thread.start()
+
+        if not self._ready_event.wait(timeout=2.0):
+            raise RuntimeError("pyWinhook keyboard hook failed to initialise")
 
     def add_hotkey(
         self, hotkey: str, callback: Callback, suppress: bool = False
@@ -81,23 +89,65 @@ class PyWinhookKeyboardAdapter:
 
         if not self._stop_event.is_set():
             self._stop_event.set()
-            try:
-                self._hook_manager.UnhookKeyboard()
-            except Exception:  # pragma: no cover - defensive cleanup
-                pass
+            self._wake_message_loop()
+            self._ready_event.wait(timeout=0.5)
+            if self._pump_thread.is_alive():
+                self._pump_thread.join(timeout=1.0)
 
     # Internal helpers -------------------------------------------------
 
-    def _pump_messages(self) -> None:
-        if pythoncom is None:  # pragma: no cover - guarded by __init__
+    def _run_message_loop(self) -> None:
+        if pythoncom is None or pyWinhook is None:  # pragma: no cover - guarded by __init__
             return
 
-        while not self._stop_event.is_set():
+        try:
+            pythoncom.CoInitialize()
+        except Exception:  # pragma: no cover - defensive fallback
+            self._ready_event.set()
+            return
+
+        try:
+            hook_manager = pyWinhook.HookManager()
+            hook_manager.KeyDown = self._on_key_down
+            hook_manager.KeyUp = self._on_key_up
+            hook_manager.HookKeyboard()
+
+            self._hook_manager = hook_manager
+            if win32api is not None:  # pragma: no branch - platform specific
+                try:
+                    self._thread_id = win32api.GetCurrentThreadId()  # type: ignore[attr-defined]
+                except Exception:  # pragma: no cover - defensive fallback
+                    self._thread_id = None
+            self._ready_event.set()
+
+            while not self._stop_event.is_set():
+                try:
+                    pythoncom.PumpWaitingMessages()
+                except pythoncom.com_error:  # pragma: no cover - defensive cleanup
+                    break
+                time.sleep(0.01)
+        finally:
             try:
-                pythoncom.PumpWaitingMessages()
-            except pythoncom.com_error:  # pragma: no cover - defensive cleanup
-                break
-            time.sleep(0.01)
+                if self._hook_manager is not None:
+                    self._hook_manager.UnhookKeyboard()
+            except Exception:  # pragma: no cover - defensive cleanup
+                pass
+            self._hook_manager = None
+            self._thread_id = None
+            self._ready_event.set()
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:  # pragma: no cover - defensive cleanup
+                pass
+
+    def _wake_message_loop(self) -> None:
+        thread_id = self._thread_id
+        if thread_id is None or win32api is None or win32con is None:  # pragma: no cover - fallback
+            return
+        try:
+            win32api.PostThreadMessage(thread_id, win32con.WM_NULL, 0, 0)
+        except Exception:  # pragma: no cover - defensive fallback
+            pass
 
     def _on_key_down(self, event: "pyWinhook.KeyboardEvent") -> bool:
         key = self._normalize_event_key(event)
