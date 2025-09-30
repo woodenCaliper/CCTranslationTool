@@ -233,17 +233,29 @@ class CCTranslationAppTests(CCTranslationAppTestMixin, unittest.TestCase):
         app._keyboard._listener.listening = False
         with mock.patch.object(app, "_register_hotkeys") as register_mock:
             register_mock.side_effect = lambda force=False: None
-            failures = app._check_keyboard_listener(0)
+            failures, state = app._check_keyboard_listener(0)
         self.assertEqual(failures, 1)
+        self.assertFalse(state)
         self.assertEqual(app._keyboard._listener.start_calls, 1)
         register_mock.assert_called_once_with(force=True)
 
     def test_keyboard_monitor_noop_when_hotkeys_inactive(self):
         app = self._create_app()
         app._hotkeys_active.clear()
-        failures = app._check_keyboard_listener(2)
+        failures, state = app._check_keyboard_listener(2)
         self.assertEqual(failures, 0)
+        self.assertTrue(state)
         self.assertEqual(app._keyboard._listener.start_calls, 0)
+
+    def test_keyboard_status_logs_every_ten_seconds(self):
+        app = self._create_app()
+        app._register_hotkeys(force=True)
+        with mock.patch("translator_app.logger.info") as info_mock:
+            app._log_keyboard_status(True, 0)
+            self.assertFalse(info_mock.called)
+            app._fake_time.advance(10.1)
+            app._log_keyboard_status(True, 0)
+            info_mock.assert_called_once()
 
     def test_clipboard_error_does_not_enqueue_and_recovers(self):
         class LockedClipboard(FakeClipboard):

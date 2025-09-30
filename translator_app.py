@@ -750,6 +750,7 @@ class CCTranslationApp:
         self._keyboard_monitor_thread: Optional[threading.Thread] = None
         self._last_copy_timestamp: float = 0.0
         self._last_keyboard_listener_state: Optional[bool] = None
+        self._last_keyboard_status_log: float = 0.0
 
     @property
     def translator(self) -> TranslatorProtocol:
@@ -821,17 +822,20 @@ class CCTranslationApp:
 
     def _monitor_keyboard_listener(self) -> None:
         failure_count = 0
-        while not self._monitor_stop_event.wait(5.0):
-            failure_count = self._check_keyboard_listener(failure_count)
+        while not self._monitor_stop_event.wait(1.0):
+            failure_count, listener_state = self._check_keyboard_listener(failure_count)
+            self._log_keyboard_status(listener_state, failure_count)
 
-    def _check_keyboard_listener(self, failure_count: int) -> int:
+    def _check_keyboard_listener(
+        self, failure_count: int
+    ) -> tuple[int, Optional[bool]]:
+        listener_state = self._get_keyboard_listener_state()
         if not self._hotkeys_active.is_set():
-            return 0
-        state = self._get_keyboard_listener_state()
-        if state is None:
-            return 0
-        if state:
-            return 0
+            return 0, listener_state
+        if listener_state is None:
+            return 0, None
+        if listener_state:
+            return 0, True
         failure_count += 1
         logger.warning(
             "Keyboard listener inactive (attempt=%d); requesting restart", failure_count
@@ -846,7 +850,47 @@ class CCTranslationApp:
             else:
                 logger.info("Keyboard listener restart requested")
         self._register_hotkeys(force=True)
-        return failure_count
+        return failure_count, False
+
+    def _get_keyboard_listener_thread_alive(self) -> Optional[bool]:
+        listener = getattr(self._keyboard, "_listener", None)
+        thread = getattr(listener, "thread", None)
+        if isinstance(thread, threading.Thread):
+            return thread.is_alive()
+        if hasattr(thread, "is_alive"):
+            try:
+                return bool(thread.is_alive())
+            except Exception:  # pragma: no cover - defensive fallback
+                return None
+        return None
+
+    def _log_keyboard_status(
+        self, listener_state: Optional[bool], failure_count: int
+    ) -> None:
+        now = self._time_provider()
+        if now - self._last_keyboard_status_log < 10.0:
+            return
+        self._last_keyboard_status_log = now
+        hotkeys_active = self._hotkeys_active.is_set()
+        monitor_alive = (
+            self._keyboard_monitor_thread.is_alive()
+            if self._keyboard_monitor_thread
+            else False
+        )
+        listener_thread_alive = self._get_keyboard_listener_thread_alive()
+        last_copy_age = None
+        if self._last_copy_timestamp:
+            last_copy_age = now - self._last_copy_timestamp
+        logger.info(
+            "Keyboard permission status: hotkeys_active=%s, listener_state=%s, listener_thread_alive=%s, monitor_alive=%s, failure_count=%d, hotkey_handles=%d, last_copy_age=%s",
+            hotkeys_active,
+            listener_state,
+            listener_thread_alive,
+            monitor_alive,
+            failure_count,
+            len(self._hotkey_handles),
+            None if last_copy_age is None else f"{last_copy_age:.3f}",
+        )
 
     def start(self, *, tray_controller: Optional[SystemTrayController] = None) -> None:
         """Start listening for keyboard events and processing translations."""
@@ -1080,18 +1124,20 @@ class CCTranslationApp:
             if self._keyboard_monitor_thread
             else False
         )
+        listener_thread_alive = self._get_keyboard_listener_thread_alive()
         last_copy_age = (
             self._time_provider() - last_copy_timestamp
             if last_copy_timestamp
             else None
         )
         logger.info(
-            "Hotkey heartbeat triggered (worker_alive=%s, queue_size=%d, pending_copy=%d, interval=%.3f, listener_active=%s, monitor_alive=%s, last_copy_age=%s)",
+            "Hotkey heartbeat triggered (worker_alive=%s, queue_size=%d, pending_copy=%d, interval=%.3f, listener_active=%s, listener_thread_alive=%s, monitor_alive=%s, last_copy_age=%s)",
             worker_alive,
             queue_size,
             pending_copy,
             last_interval,
             listener_state,
+            listener_thread_alive,
             monitor_alive,
             None if last_copy_age is None else f"{last_copy_age:.3f}",
         )
@@ -1112,13 +1158,14 @@ class CCTranslationApp:
             if self._keyboard_monitor_thread
             else False
         )
+        listener_thread_alive = self._get_keyboard_listener_thread_alive()
         last_copy_age = (
             self._time_provider() - last_copy_timestamp
             if last_copy_timestamp
             else None
         )
         logger.info(
-            "Diagnostics dump: worker_alive=%s, queue_size=%d, pending_copy=%d, interval=%.3f, restart=%s, stop=%s, listener_active=%s, monitor_alive=%s, hotkeys_active=%s, last_copy_age=%s, threads=[%s]",
+            "Diagnostics dump: worker_alive=%s, queue_size=%d, pending_copy=%d, interval=%.3f, restart=%s, stop=%s, listener_active=%s, listener_thread_alive=%s, monitor_alive=%s, hotkeys_active=%s, last_copy_age=%s, threads=[%s]",
             worker_alive,
             queue_size,
             pending_copy,
@@ -1126,6 +1173,7 @@ class CCTranslationApp:
             self._restart_event.is_set(),
             self._stop_event.is_set(),
             listener_state,
+            listener_thread_alive,
             monitor_alive,
             self._hotkeys_active.is_set(),
             None if last_copy_age is None else f"{last_copy_age:.3f}",
