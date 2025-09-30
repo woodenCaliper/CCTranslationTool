@@ -5,18 +5,14 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import queue
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import IO, Callable, Optional, Protocol
-
-try:  # pragma: no cover - executed during module import
-    import keyboard  # type: ignore
-except ImportError:  # pragma: no cover - handled in __init__
-    keyboard = None  # type: ignore
+from typing import IO, Callable, Optional, Protocol, Sequence
 
 try:  # pragma: no cover - executed during module import
     import pyperclip  # type: ignore
@@ -45,12 +41,60 @@ except ImportError:  # pragma: no cover - handled when starting the tray icon
 import sys
 import tempfile
 
+from logging.handlers import RotatingFileHandler
+
+from hotkey_manager import (
+    BaseHotkeyService,
+    HotkeyBinding,
+    HotkeyEvent,
+    RegisterHotKeyService,
+    build_bindings_from_preferences,
+)
 from translation_service import GoogleTranslateClient, TranslationError, TranslationResult
 
 
-DOUBLE_COPY_INTERVAL = 0.5  # Seconds allowed between two copy events.
+DOUBLE_COPY_INTERVAL = 0.25  # Seconds allowed between two copy events.
+MIN_TRIGGER_INTERVAL = 0.15
+
+LOG_FILE_NAME = "cctranslationtool_hotkeys.log"
+LOG_MAX_BYTES = 2_097_152
+LOG_BACKUP_COUNT = 3
 
 PREFERENCES_FILE = Path.home() / ".cctranslationtool_preferences.json"
+
+DEFAULT_HOTKEY_PREFERENCES = {
+    "copy": {"combo": "Ctrl+C", "press_count": 2},
+    "state_dump": {"combo": "F8", "press_count": 1},
+    "double_press_interval": DOUBLE_COPY_INTERVAL,
+    "min_trigger_interval": MIN_TRIGGER_INTERVAL,
+}
+
+
+def _get_hotkey_logger() -> logging.Logger:
+    logger = logging.getLogger("cctranslationtool.hotkeys")
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+    log_dir = PREFERENCES_FILE.parent
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    log_path = log_dir / LOG_FILE_NAME
+    handler = RotatingFileHandler(
+        log_path,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
+    logger.addHandler(console)
+    return logger
 
 LANGUAGE_SEQUENCE = ("ja", "en")
 LANGUAGE_DISPLAY_NAMES = {
@@ -61,21 +105,69 @@ LANGUAGE_DISPLAY_NAMES = {
 }
 
 
-def _load_saved_dest_language(default: str = "ja") -> str:
+def _load_preferences() -> dict:
     try:
         data = json.loads(PREFERENCES_FILE.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return default
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_preferences(preferences: dict) -> None:
+    try:
+        PREFERENCES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PREFERENCES_FILE.write_text(json.dumps(preferences, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _load_saved_dest_language(default: str = "ja") -> str:
+    data = _load_preferences()
     dest = data.get("dest_language") if isinstance(data, dict) else None
     return dest if isinstance(dest, str) else default
 
 
 def _save_dest_language(dest: str) -> None:
-    try:
-        PREFERENCES_FILE.parent.mkdir(parents=True, exist_ok=True)
-        PREFERENCES_FILE.write_text(json.dumps({"dest_language": dest}), encoding="utf-8")
-    except OSError:
-        pass
+    data = _load_preferences()
+    data["dest_language"] = dest
+    if "hotkeys" not in data:
+        data["hotkeys"] = DEFAULT_HOTKEY_PREFERENCES
+    _save_preferences(data)
+
+
+def _load_hotkey_preferences() -> dict:
+    data = _load_preferences()
+    hotkeys = data.get("hotkeys") if isinstance(data, dict) else None
+    if not isinstance(hotkeys, dict):
+        hotkeys = {}
+
+    result = json.loads(json.dumps(DEFAULT_HOTKEY_PREFERENCES))
+
+    def _merge_single(key: str, default_press: int) -> None:
+        source = hotkeys.get(key)
+        if not isinstance(source, dict):
+            return
+        combo = source.get("combo")
+        press_count = source.get("press_count")
+        if isinstance(combo, str) and combo.strip():
+            result[key]["combo"] = combo.strip()
+        if isinstance(press_count, int) and press_count >= 1:
+            result[key]["press_count"] = press_count
+        else:
+            result[key]["press_count"] = default_press
+
+    _merge_single("copy", DEFAULT_HOTKEY_PREFERENCES["copy"]["press_count"])
+    _merge_single("state_dump", DEFAULT_HOTKEY_PREFERENCES["state_dump"]["press_count"])
+
+    double_interval = hotkeys.get("double_press_interval")
+    if isinstance(double_interval, (int, float)) and double_interval > 0:
+        result["double_press_interval"] = float(double_interval)
+
+    min_interval = hotkeys.get("min_trigger_interval")
+    if isinstance(min_interval, (int, float)) and min_interval >= 0:
+        result["min_trigger_interval"] = float(min_interval)
+
+    return result
 
 
 def _language_display(language_code: Optional[str]) -> str:
@@ -110,23 +202,24 @@ class DoubleCopyDetector:
 
     interval: float
     now: Callable[[], float]
+    required_count: int = 2
     _last_time: float = field(default=0.0, init=False)
     _count: int = field(default=0, init=False)
 
-    def register(self) -> bool:
+    def register(self, *, timestamp: Optional[float] = None) -> bool:
         """Register a copy event.
 
         Returns ``True`` if the event completes a "double copy" sequence.
         """
 
-        current = self.now()
+        current = self.now() if timestamp is None else timestamp
         if current - self._last_time <= self.interval:
             self._count += 1
         else:
             self._count = 1
         self._last_time = current
 
-        if self._count >= 2:
+        if self._count >= self.required_count:
             self._count = 0
             return True
         return False
@@ -676,32 +769,50 @@ class CCTranslationApp:
         source_language: Optional[str] = None,
         *,
         translator_factory: Callable[[], TranslatorProtocol] = GoogleTranslateClient,
-        keyboard_module=keyboard,
         clipboard_module=pyperclip,
-        time_provider: Callable[[], float] = time.time,
+        time_provider: Callable[[], float] = time.perf_counter,
         display_callback: Optional[Callable[[str, str, Optional[str]], None]] = None,
-        double_copy_interval: float = DOUBLE_COPY_INTERVAL,
+        double_copy_interval: Optional[float] = None,
+        min_trigger_interval: Optional[float] = None,
+        hotkey_service_factory: Optional[
+            Callable[[Sequence[HotkeyBinding], "queue.Queue[HotkeyEvent]", logging.Logger, Callable[[], float]], BaseHotkeyService]
+        ] = None,
+        hotkey_bindings: Optional[Sequence[HotkeyBinding]] = None,
     ) -> None:
         self.dest_language = dest_language
         self.source_language = source_language
         self._translator: Optional[TranslatorProtocol] = None
         self._translator_factory = translator_factory
         self._translator_lock = threading.Lock()
-        self._copy_detector = DoubleCopyDetector(double_copy_interval, time_provider)
+        self._hotkey_preferences = _load_hotkey_preferences()
+        if double_copy_interval is None:
+            double_copy_interval = self._hotkey_preferences.get(
+                "double_press_interval", DOUBLE_COPY_INTERVAL
+            )
+        copy_press_count = max(
+            1,
+            int(self._hotkey_preferences["copy"].get("press_count", DEFAULT_HOTKEY_PREFERENCES["copy"]["press_count"])),
+        )
+        self._copy_detector = DoubleCopyDetector(
+            double_copy_interval, time_provider, required_count=copy_press_count
+        )
+        self._min_trigger_interval = (
+            min_trigger_interval
+            if min_trigger_interval is not None
+            else self._hotkey_preferences.get("min_trigger_interval", MIN_TRIGGER_INTERVAL)
+        )
+        self._last_trigger_time = 0.0
+        self._time_provider = time_provider
         self._lock = threading.Lock()
         self._request_queue: "queue.Queue[TranslationRequest]" = queue.Queue()
+        self._hotkey_event_queue: "queue.Queue[HotkeyEvent]" = queue.Queue()
         self._stop_event = threading.Event()
         self._restart_event = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
-        if keyboard_module is None:
-            raise RuntimeError(
-                "The 'keyboard' package is required. Install it with 'pip install keyboard'."
-            )
         if clipboard_module is None:
             raise RuntimeError(
                 "The 'pyperclip' package is required. Install it with 'pip install pyperclip'."
             )
-        self._keyboard = keyboard_module
         self._clipboard = clipboard_module
         self._display_callback = display_callback
         self._window_manager = TranslationWindowManager(
@@ -714,6 +825,38 @@ class CCTranslationApp:
         self._tray_controller: Optional[SystemTrayController] = None
         self._language_options = list(LANGUAGE_SEQUENCE)
         self._last_original_text: Optional[str] = None
+        self._hotkey_logger = _get_hotkey_logger()
+        self._hotkey_service_factory = hotkey_service_factory
+        self._hotkey_service: Optional[BaseHotkeyService] = None
+        self._hotkey_dispatcher: Optional[threading.Thread] = None
+        self._state_dump_press_count = max(
+            1,
+            int(
+                self._hotkey_preferences["state_dump"].get(
+                    "press_count", DEFAULT_HOTKEY_PREFERENCES["state_dump"]["press_count"]
+                )
+            ),
+        )
+        self._state_dump_detector = (
+            DoubleCopyDetector(
+                double_copy_interval,
+                time_provider,
+                required_count=self._state_dump_press_count,
+            )
+            if self._state_dump_press_count > 1
+            else None
+        )
+        if hotkey_bindings is not None:
+            self._hotkey_bindings = list(hotkey_bindings)
+        elif sys.platform == "win32":
+            prefs_for_bindings = {"hotkeys": self._hotkey_preferences}
+            try:
+                self._hotkey_bindings = build_bindings_from_preferences(prefs_for_bindings)
+            except Exception as exc:
+                self._hotkey_logger.error("Failed to build hotkey bindings: %s", exc)
+                self._hotkey_bindings = []
+        else:
+            self._hotkey_bindings = []
 
     @property
     def translator(self) -> TranslatorProtocol:
@@ -733,12 +876,17 @@ class CCTranslationApp:
 
         self._tray_controller = tray_controller
 
-        if self._worker_thread is None or not self._worker_thread.is_alive():
-            self._worker_thread = threading.Thread(target=self._process_requests, daemon=True)
-            self._worker_thread.start()
-
         while True:
-            self._keyboard.add_hotkey("ctrl+c", self._handle_copy_event, suppress=False)
+            self._ensure_background_threads()
+            self._hotkey_service = self._create_hotkey_service()
+            if self._hotkey_service is not None:
+                try:
+                    self._hotkey_service.start()
+                    self._hotkey_logger.info("Hotkey service started with %s", self._hotkey_service.describe_bindings())
+                except Exception as exc:
+                    self._hotkey_logger.exception("Failed to start hotkey service: %s", exc)
+                    self._hotkey_service.stop()
+                    self._hotkey_service = None
 
             print(
                 "CCTranslationTool is running. Double press Ctrl+C on selected text to translate."
@@ -751,9 +899,12 @@ class CCTranslationApp:
             except KeyboardInterrupt:  # pragma: no cover - manual console interruption
                 self.stop()
             finally:
-                self._keyboard.unhook_all()
                 if self._tray_controller is not None:
                     self._tray_controller.stop()
+                if self._hotkey_service is not None:
+                    self._hotkey_service.stop()
+                    self._hotkey_logger.info("Hotkey service stopped")
+                    self._hotkey_service = None
 
             if self._restart_event.is_set():
                 self._restart_event.clear()
@@ -767,6 +918,8 @@ class CCTranslationApp:
 
         self._restart_event.clear()
         self._stop_event.set()
+        if self._hotkey_dispatcher is not None and self._hotkey_dispatcher.is_alive():
+            self._hotkey_event_queue.put(None)
 
     def reboot(self) -> None:
         """Restart the application loop and reset cached translator state."""
@@ -774,6 +927,74 @@ class CCTranslationApp:
         self._reset_translator()
         self._restart_event.set()
         self._stop_event.set()
+
+    @staticmethod
+    def _default_hotkey_service_factory(
+        bindings: Sequence[HotkeyBinding],
+        event_queue: "queue.Queue[HotkeyEvent]",
+        logger: logging.Logger,
+        time_provider: Callable[[], float],
+    ) -> BaseHotkeyService:
+        return RegisterHotKeyService(bindings, event_queue, logger, time_provider=time_provider)
+
+    def _create_hotkey_service(self) -> Optional[BaseHotkeyService]:
+        if not self._hotkey_bindings:
+            self._hotkey_logger.warning(
+                "No hotkey bindings available; global hotkeys are disabled"
+            )
+            return None
+        factory = self._hotkey_service_factory or self._default_hotkey_service_factory
+        try:
+            return factory(self._hotkey_bindings, self._hotkey_event_queue, self._hotkey_logger, self._time_provider)
+        except Exception as exc:
+            self._hotkey_logger.exception("Failed to create hotkey service: %s", exc)
+            return None
+
+    def _ensure_background_threads(self) -> None:
+        if self._worker_thread is None or not self._worker_thread.is_alive():
+            self._worker_thread = threading.Thread(target=self._process_requests, daemon=True)
+            self._worker_thread.start()
+        if self._hotkey_dispatcher is None or not self._hotkey_dispatcher.is_alive():
+            self._hotkey_dispatcher = threading.Thread(
+                target=self._dispatch_hotkey_events,
+                name="HotkeyDispatcher",
+                daemon=True,
+            )
+            self._hotkey_dispatcher.start()
+
+    def _dispatch_hotkey_events(self) -> None:
+        while True:
+            event = self._hotkey_event_queue.get()
+            if event is None:
+                break
+            try:
+                self._process_hotkey_event(event)
+            except Exception as exc:  # pragma: no cover - logging runtime issues
+                self._hotkey_logger.exception("Error while processing hotkey event: %s", exc)
+
+    def _process_hotkey_event(self, event: HotkeyEvent) -> None:
+        if event.name == "copy":
+            self._handle_copy_event(timestamp=event.timestamp)
+        elif event.name == "state_dump":
+            self._handle_state_dump_event(timestamp=event.timestamp)
+        else:
+            self._hotkey_logger.debug("Unknown hotkey event: %s", event.name)
+
+    def _handle_state_dump_event(self, *, timestamp: float) -> None:
+        if self._state_dump_detector is not None and not self._state_dump_detector.register(
+            timestamp=timestamp
+        ):
+            return
+        bindings = []
+        if self._hotkey_service is not None:
+            bindings = list(self._hotkey_service.describe_bindings())
+        self._hotkey_logger.info(
+            "Hotkey state dump | bindings=%s | queue=%d | last_trigger=%.3f | restart_flag=%s",
+            bindings,
+            self._request_queue.qsize(),
+            self._last_trigger_time,
+            self._restart_event.is_set(),
+        )
 
     def _toggle_language(self) -> None:
         with self._lock:
@@ -814,24 +1035,31 @@ class CCTranslationApp:
             dest = self.dest_language
         self._enqueue_retranslation(last_text, src, dest)
 
-    def _handle_copy_event(self) -> None:
+    def _handle_copy_event(self, *, timestamp: Optional[float] = None) -> None:
         with self._lock:
-            if self._copy_detector.register():
-                try:
-                    text = self._clipboard.paste()
-                except Exception as exc:  # pragma: no cover - exercised via unit tests
-                    if pyperclip is not None and isinstance(exc, pyperclip.PyperclipException):
-                        message = f"Failed to read clipboard: {exc}"
-                    else:
-                        message = f"Unexpected error while accessing clipboard: {exc}"
-                    print(message)
-                    self._copy_detector.reset()
-                    return
-                text = text.strip()
-                if text:
-                    self._request_queue.put(
-                        TranslationRequest(text=text, src=self.source_language, dest=self.dest_language)
-                    )
+            if not self._copy_detector.register(timestamp=timestamp):
+                return
+            current_time = timestamp if timestamp is not None else self._time_provider()
+            if current_time - self._last_trigger_time < self._min_trigger_interval:
+                return
+            self._last_trigger_time = current_time
+
+        try:
+            text = self._clipboard.paste()
+        except Exception as exc:  # pragma: no cover - exercised via unit tests
+            if pyperclip is not None and isinstance(exc, pyperclip.PyperclipException):
+                message = f"Failed to read clipboard: {exc}"
+            else:
+                message = f"Unexpected error while accessing clipboard: {exc}"
+            self._hotkey_logger.error(message)
+            self._copy_detector.reset()
+            return
+
+        text = text.strip()
+        if text:
+            self._request_queue.put(
+                TranslationRequest(text=text, src=self.source_language, dest=self.dest_language)
+            )
 
     def _process_requests(self) -> None:
         while True:
