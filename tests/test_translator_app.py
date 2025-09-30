@@ -8,6 +8,7 @@ import unittest
 import unittest.mock as mock
 from contextlib import redirect_stdout
 from types import SimpleNamespace
+from typing import Callable
 
 if "pystray" not in sys.modules:
     stub_pystray = types.ModuleType("pystray")
@@ -61,9 +62,20 @@ class FakeKeyboard:
         self.unhooked = False
         self.hooks = []
         self.pressed: set[str] = set()
+        self.next_handle = 0
+        self.hotkeys: dict[object, tuple[tuple, dict]] = {}
+        self.removed: list[object] = []
 
     def add_hotkey(self, *args, **kwargs):  # pragma: no cover - only used in manual runs
+        handle = self.next_handle
+        self.next_handle += 1
         self.registered.append((args, kwargs))
+        self.hotkeys[handle] = (args, kwargs)
+        return handle
+
+    def remove_hotkey(self, handle):  # pragma: no cover - only used in manual runs
+        self.removed.append(handle)
+        self.hotkeys.pop(handle, None)
 
     def wait(self):  # pragma: no cover - only used in manual runs
         raise RuntimeError("wait should not be called during tests")
@@ -85,12 +97,22 @@ class FakeKeyboard:
 class RecordingKeyboard(FakeKeyboard):
     def __init__(self) -> None:
         super().__init__()
-        self.callbacks = {}
+        self.callbacks_by_combo: dict[str, Callable[[object], None]] = {}
 
     def add_hotkey(self, *args, **kwargs):  # pragma: no cover - invoked via tests
-        super().add_hotkey(*args, **kwargs)
+        handle = super().add_hotkey(*args, **kwargs)
         if len(args) >= 2 and callable(args[1]):
-            self.callbacks[args[0]] = args[1]
+            combo = args[0]
+            self.callbacks_by_combo[combo] = args[1]
+        return handle
+
+    def remove_hotkey(self, handle):  # pragma: no cover - invoked via tests
+        combo = None
+        if handle in self.hotkeys:
+            combo = self.hotkeys[handle][0][0]
+        super().remove_hotkey(handle)
+        if combo is not None:
+            self.callbacks_by_combo.pop(combo, None)
 
 
 class FakeTranslator:
@@ -335,23 +357,27 @@ class CCTranslationAppTests(CCTranslationAppTestMixin, unittest.TestCase):
             app._register_copy_hotkeys()
 
             callback = None
-            for combo, cb in keyboard.callbacks.items():
+            for combo, cb in keyboard.callbacks_by_combo.items():
                 if combo in ("ime hangul mode", "ime kanji mode"):
                     callback = cb
                     break
 
             self.assertIsNotNone(callback)
             if callback is not None:
+                original_handle = app._copy_hotkey_handle
                 callback()
+                self.assertIsNotNone(app._copy_hotkey_handle)
+                self.assertNotEqual(app._copy_hotkey_handle, original_handle)
+                self.assertIn(original_handle, keyboard.removed)
         self.assertFalse(fake_state.altgr_is_pressed)
         self.assertFalse(fake_state.ignore_next_right_alt)
 
     def test_ime_toggle_fallback_hook_resets_altgr_state(self):
         class FallbackImeKeyboard(RecordingKeyboard):
-            def add_hotkey(self, combo, callback, suppress=False):  # type: ignore[override]
+            def add_hotkey(self, combo, callback, suppress=False, **kwargs):  # type: ignore[override]
                 if combo in ("ime hangul mode", "ime kanji mode"):
                     raise RuntimeError("unsupported hotkey")
-                return super().add_hotkey(combo, callback, suppress=suppress)
+                return super().add_hotkey(combo, callback, suppress=suppress, **kwargs)
 
         keyboard = FallbackImeKeyboard()
         app = self._create_app(keyboard_module=keyboard)
@@ -369,10 +395,14 @@ class CCTranslationAppTests(CCTranslationAppTestMixin, unittest.TestCase):
                 is_keypad=False,
                 time=1.23,
             )
+            original_handle = app._copy_hotkey_handle
             keyboard.simulate_event(event)
 
         self.assertFalse(fake_state.altgr_is_pressed)
         self.assertFalse(fake_state.ignore_next_right_alt)
+        self.assertIsNotNone(app._copy_hotkey_handle)
+        self.assertNotEqual(app._copy_hotkey_handle, original_handle)
+        self.assertIn(original_handle, keyboard.removed)
 
     def test_debug_keyboard_hook_logs_events(self):
         keyboard = RecordingKeyboard()

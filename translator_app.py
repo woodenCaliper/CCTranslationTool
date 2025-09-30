@@ -728,6 +728,8 @@ class CCTranslationApp:
         self._debug_keyboard = debug_keyboard
         self._keyboard_debug_hook: Optional[Callable[[object], None]] = None
         self._ime_fallback_hook: Optional[Callable[[object], None]] = None
+        self._copy_hotkey_handle: Optional[object] = None
+        self._hotkey_lock = threading.Lock()
 
     @property
     def translator(self) -> TranslatorProtocol:
@@ -739,7 +741,7 @@ class CCTranslationApp:
         return translator
 
     def _register_copy_hotkeys(self) -> None:
-        self._keyboard.add_hotkey("ctrl+c", self._handle_copy_event, suppress=False)
+        self._refresh_copy_hotkey()
         self._register_ime_toggle_workaround()
         self._install_keyboard_debug_hook()
 
@@ -762,6 +764,7 @@ class CCTranslationApp:
                     "ignore_next_right_alt=False",
                     flush=True,
                 )
+            self._refresh_copy_hotkey()
 
         registered_any = False
         for key_name in ("ime hangul mode", "ime kanji mode"):
@@ -868,6 +871,29 @@ class CCTranslationApp:
 
         self._keyboard_debug_hook = log_event
 
+    def _refresh_copy_hotkey(self) -> None:
+        with self._hotkey_lock:
+            handle = self._copy_hotkey_handle
+            if handle is not None:
+                try:
+                    self._keyboard.remove_hotkey(handle)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                finally:
+                    self._copy_hotkey_handle = None
+
+            try:
+                self._copy_hotkey_handle = self._keyboard.add_hotkey(
+                    "ctrl+c", self._handle_copy_event, suppress=False
+                )
+            except Exception as exc:
+                self._copy_hotkey_handle = None
+                if self._debug_keyboard:
+                    print(
+                        f"[keyboard-debug] failed to register copy hotkey: {exc}",
+                        flush=True,
+                    )
+
     def _reset_translator(self) -> None:
         with self._translator_lock:
             self._translator = None
@@ -898,6 +924,8 @@ class CCTranslationApp:
                 self.stop()
             finally:
                 self._keyboard.unhook_all()
+                with self._hotkey_lock:
+                    self._copy_hotkey_handle = None
                 if self._tray_controller is not None:
                     self._tray_controller.stop()
 
