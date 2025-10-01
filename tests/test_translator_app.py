@@ -1,6 +1,5 @@
 import io
 import queue
-import threading
 import sys
 import threading
 import types
@@ -83,6 +82,11 @@ class FakeTranslator:
 class ErroringTranslator:
     def translate(self, text: str, src=None, dest=None):
         raise TranslationError("boom")
+
+
+class CrashingTranslator:
+    def translate(self, text: str, src=None, dest=None):
+        raise RuntimeError("kaboom")
 
 
 class CCTranslationAppTestMixin:
@@ -198,6 +202,31 @@ class CCTranslationAppTests(CCTranslationAppTestMixin, unittest.TestCase):
         self.assertFalse(app._stop_event.is_set())
         app.stop()
         self.assertTrue(app._stop_event.is_set())
+
+    def test_worker_handles_unexpected_exception_and_stops(self):
+        captured = []
+
+        def capture(original, translated, detected):
+            captured.append((original, translated, detected))
+
+        app = self._create_app(
+            translator_factory=lambda: CrashingTranslator(),
+            display_callback=capture,
+        )
+
+        worker = threading.Thread(target=app._process_requests, daemon=True)
+        worker.start()
+
+        app._request_queue.put(TranslationRequest(text="hello", src="en", dest="ja"))
+        app._request_queue.join()
+
+        app._stop_event.set()
+        worker.join(timeout=1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(captured)
+        self.assertIn("Unexpected error during translation", captured[0][1])
+        self.assertEqual(captured[0][2], "en")
 
     def test_clipboard_error_does_not_enqueue_and_recovers(self):
         class LockedClipboard(FakeClipboard):
