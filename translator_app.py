@@ -768,7 +768,7 @@ class CCTranslationApp:
         translator_factory: Callable[[], TranslatorProtocol] = GoogleTranslateClient,
         keyboard_module=None,
         clipboard_module=pyperclip,
-        time_provider: Callable[[], float] = time.time,
+        time_provider: Callable[[], float] = time.monotonic,
         display_callback: Optional[Callable[[str, str, Optional[str]], None]] = None,
         double_copy_interval: float = DOUBLE_COPY_INTERVAL,
     ) -> None:
@@ -930,9 +930,20 @@ class CCTranslationApp:
 
     def _process_requests(self) -> None:
         while True:
-            request = self._request_queue.get()
+            if self._stop_event.is_set() and self._request_queue.empty():
+                break
+
+            try:
+                request = self._request_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
             try:
                 self._process_single_request(request)
+            except Exception as exc:  # pragma: no cover - defensive safeguard
+                message = f"Unexpected error during translation: {exc}"
+                print(message, file=sys.stderr)
+                self._render_translation(request, message, request.src)
             finally:
                 self._request_queue.task_done()
 
