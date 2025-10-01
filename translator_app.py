@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
 import queue
 import threading
 import time
@@ -58,21 +59,129 @@ LANGUAGE_DISPLAY_NAMES = {
 }
 
 
-def _load_saved_dest_language(default: str = "ja") -> str:
+_TIMING_ENV_VAR = "CCTRANSLATION_TIMING_LOGS"
+_TIMING_WARNING_THRESHOLD = 0.5
+_TIMING_LOGS_ENABLED = os.environ.get(_TIMING_ENV_VAR, "").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+def _timing_enabled() -> bool:
+    return _TIMING_LOGS_ENABLED
+
+
+def _timing_log(
+    label: str,
+    event: str,
+    timestamp: float,
+    duration: Optional[float] = None,
+    *,
+    warn: bool = False,
+    extra: str = "",
+) -> None:
+    if not _timing_enabled():
+        return
+    prefix = "[TIMING WARN]" if warn else "[TIMING]"
+    time_str = time.strftime("%H:%M:%S", time.localtime(timestamp))
+    parts = [prefix, time_str, label, event]
+    if duration is not None:
+        parts.append(f"Δ{duration:.3f}s")
+    if extra:
+        parts.append(extra)
+    print(" ".join(parts))
+
+
+@contextlib.contextmanager
+def _timed_scope(label: str):
+    if not _timing_enabled():
+        yield
+        return
+    start_wall = time.time()
+    start_perf = time.perf_counter()
+    _timing_log(label, "start", start_wall)
     try:
-        data = json.loads(PREFERENCES_FILE.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return default
-    dest = data.get("dest_language") if isinstance(data, dict) else None
-    return dest if isinstance(dest, str) else default
+        yield
+    finally:
+        end_wall = time.time()
+        duration = time.perf_counter() - start_perf
+        _timing_log(
+            label,
+            "end",
+            end_wall,
+            duration,
+            warn=duration > _TIMING_WARNING_THRESHOLD,
+        )
+
+
+@contextlib.contextmanager
+def _timed_lock(lock: threading.Lock, label: str):
+    if not _timing_enabled():
+        lock.acquire()
+        try:
+            yield
+        finally:
+            lock.release()
+        return
+    acquire_wall_start = time.time()
+    acquire_perf_start = time.perf_counter()
+    _timing_log(label, "lock acquire start", acquire_wall_start)
+    lock.acquire()
+    acquire_perf_end = time.perf_counter()
+    acquire_wall_end = time.time()
+    acquire_duration = acquire_perf_end - acquire_perf_start
+    _timing_log(
+        label,
+        "lock acquired",
+        acquire_wall_end,
+        acquire_duration,
+        warn=acquire_duration > _TIMING_WARNING_THRESHOLD,
+    )
+    try:
+        yield
+    finally:
+        release_perf_start = time.perf_counter()
+        lock.release()
+        release_perf_end = time.perf_counter()
+        release_wall_end = time.time()
+        hold_duration = release_perf_start - acquire_perf_end
+        total_duration = release_perf_end - acquire_perf_start
+        _timing_log(
+            label,
+            "lock released",
+            release_wall_end,
+            hold_duration,
+            warn=hold_duration > _TIMING_WARNING_THRESHOLD,
+            extra=f"(total Δ{total_duration:.3f}s)",
+        )
+
+
+def _load_saved_dest_language(default: str = "ja") -> str:
+    with _timed_scope("_load_saved_dest_language"):
+        try:
+            with _timed_scope("_load_saved_dest_language.read_text"):
+                raw = PREFERENCES_FILE.read_text(encoding="utf-8")
+            with _timed_scope("_load_saved_dest_language.json_loads"):
+                data = json.loads(raw)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return default
+        dest = data.get("dest_language") if isinstance(data, dict) else None
+        return dest if isinstance(dest, str) else default
 
 
 def _save_dest_language(dest: str) -> None:
-    try:
-        PREFERENCES_FILE.parent.mkdir(parents=True, exist_ok=True)
-        PREFERENCES_FILE.write_text(json.dumps({"dest_language": dest}), encoding="utf-8")
-    except OSError:
-        pass
+    with _timed_scope("_save_dest_language"):
+        try:
+            with _timed_scope("_save_dest_language.mkdir"):
+                PREFERENCES_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with _timed_scope("_save_dest_language.write_text"):
+                PREFERENCES_FILE.write_text(
+                    json.dumps({"dest_language": dest}), encoding="utf-8"
+                )
+        except OSError:
+            pass
 
 
 def _language_display(language_code: Optional[str]) -> str:
@@ -809,7 +918,7 @@ class CCTranslationApp:
 
     @property
     def translator(self) -> TranslatorProtocol:
-        with self._translator_lock:
+        with _timed_lock(self._translator_lock, "CCTranslationApp.translator._translator_lock"):
             if self._translator is None:
                 self._translator = self._translator_factory()
             translator = self._translator
@@ -817,7 +926,7 @@ class CCTranslationApp:
         return translator
 
     def _reset_translator(self) -> None:
-        with self._translator_lock:
+        with _timed_lock(self._translator_lock, "CCTranslationApp._reset_translator._translator_lock"):
             self._translator = None
 
     def start(self, *, tray_controller: Optional[SystemTrayController] = None) -> None:
@@ -871,62 +980,72 @@ class CCTranslationApp:
         self._stop_event.set()
 
     def _toggle_language(self) -> None:
-        with self._lock:
-            if self.source_language and self.dest_language:
-                self.source_language, self.dest_language = self.dest_language, self.source_language
-            else:
-                try:
-                    current_index = self._language_options.index(self.dest_language)
-                except ValueError:
-                    current_index = -1
-                next_index = (current_index + 1) % len(self._language_options)
-                self.dest_language = self._language_options[next_index]
-            self._window_manager.update_languages(self.source_language, self.dest_language)
-            _save_dest_language(self.dest_language)
-            last_text = self._last_original_text
-            src = self.source_language
-            dest = self.dest_language
-        self._enqueue_retranslation(last_text, src, dest)
+        with _timed_scope("CCTranslationApp._toggle_language"):
+            with _timed_lock(self._lock, "CCTranslationApp._toggle_language._lock"):
+                if self.source_language and self.dest_language:
+                    self.source_language, self.dest_language = (
+                        self.dest_language,
+                        self.source_language,
+                    )
+                else:
+                    try:
+                        current_index = self._language_options.index(self.dest_language)
+                    except ValueError:
+                        current_index = -1
+                    next_index = (current_index + 1) % len(self._language_options)
+                    self.dest_language = self._language_options[next_index]
+                self._window_manager.update_languages(self.source_language, self.dest_language)
+                _save_dest_language(self.dest_language)
+                last_text = self._last_original_text
+                src = self.source_language
+                dest = self.dest_language
+            self._enqueue_retranslation(last_text, src, dest)
 
     def _set_dest_language(self, language: str) -> None:
-        with self._lock:
-            self.dest_language = language
-            if language not in self._language_options:
-                self._language_options.append(language)
-            self._window_manager.update_languages(self.source_language, self.dest_language)
-            _save_dest_language(self.dest_language)
-            last_text = self._last_original_text
-            src = self.source_language
-            dest = self.dest_language
-        self._enqueue_retranslation(last_text, src, dest)
+        with _timed_scope("CCTranslationApp._set_dest_language"):
+            with _timed_lock(self._lock, "CCTranslationApp._set_dest_language._lock"):
+                self.dest_language = language
+                if language not in self._language_options:
+                    self._language_options.append(language)
+                self._window_manager.update_languages(self.source_language, self.dest_language)
+                _save_dest_language(self.dest_language)
+                last_text = self._last_original_text
+                src = self.source_language
+                dest = self.dest_language
+            self._enqueue_retranslation(last_text, src, dest)
 
     def _set_source_language(self, language: Optional[str]) -> None:
-        with self._lock:
-            self.source_language = language
-            self._window_manager.update_languages(self.source_language, self.dest_language)
-            last_text = self._last_original_text
-            src = self.source_language
-            dest = self.dest_language
-        self._enqueue_retranslation(last_text, src, dest)
+        with _timed_scope("CCTranslationApp._set_source_language"):
+            with _timed_lock(self._lock, "CCTranslationApp._set_source_language._lock"):
+                self.source_language = language
+                self._window_manager.update_languages(self.source_language, self.dest_language)
+                last_text = self._last_original_text
+                src = self.source_language
+                dest = self.dest_language
+            self._enqueue_retranslation(last_text, src, dest)
 
     def _handle_copy_event(self) -> None:
-        with self._lock:
-            if self._copy_detector.register():
-                try:
-                    text = self._clipboard.paste()
-                except Exception as exc:  # pragma: no cover - exercised via unit tests
-                    if pyperclip is not None and isinstance(exc, pyperclip.PyperclipException):
-                        message = f"Failed to read clipboard: {exc}"
-                    else:
-                        message = f"Unexpected error while accessing clipboard: {exc}"
-                    print(message)
-                    self._copy_detector.reset()
-                    return
-                text = text.strip()
-                if text:
-                    self._request_queue.put(
-                        TranslationRequest(text=text, src=self.source_language, dest=self.dest_language)
-                    )
+        with _timed_scope("CCTranslationApp._handle_copy_event"):
+            with _timed_lock(self._lock, "CCTranslationApp._handle_copy_event._lock"):
+                if self._copy_detector.register():
+                    try:
+                        with _timed_scope("CCTranslationApp._handle_copy_event.paste"):
+                            text = self._clipboard.paste()
+                    except Exception as exc:  # pragma: no cover - exercised via unit tests
+                        if pyperclip is not None and isinstance(exc, pyperclip.PyperclipException):
+                            message = f"Failed to read clipboard: {exc}"
+                        else:
+                            message = f"Unexpected error while accessing clipboard: {exc}"
+                        print(message)
+                        self._copy_detector.reset()
+                        return
+                    text = text.strip()
+                    if text:
+                        self._request_queue.put(
+                            TranslationRequest(
+                                text=text, src=self.source_language, dest=self.dest_language
+                            )
+                        )
 
     def _process_requests(self) -> None:
         while True:
@@ -937,21 +1056,29 @@ class CCTranslationApp:
                 self._request_queue.task_done()
 
     def _process_single_request(self, request: TranslationRequest) -> None:
-        with self._lock:
-            self._last_original_text = request.text
-        try:
-            translation = self.translator.translate(request.text, src=request.src, dest=request.dest)
-        except TranslationError as exc:  # pragma: no cover - network errors are runtime issues
-            self._render_translation(
-                request,
-                f"Error during translation: {exc}",
-                request.src,
-            )
-            return
+        with _timed_scope("CCTranslationApp._process_single_request"):
+            with _timed_lock(
+                self._lock, "CCTranslationApp._process_single_request._lock"
+            ):
+                self._last_original_text = request.text
+            try:
+                with _timed_scope("CCTranslationApp._process_single_request.translate"):
+                    translation = self.translator.translate(
+                        request.text, src=request.src, dest=request.dest
+                    )
+            except TranslationError as exc:  # pragma: no cover - network errors are runtime issues
+                self._render_translation(
+                    request,
+                    f"Error during translation: {exc}",
+                    request.src,
+                )
+                return
 
-        translated_text = getattr(translation, "text", str(translation))
-        detected_source = getattr(translation, "detected_source", getattr(translation, "src", None))
-        self._render_translation(request, translated_text, detected_source)
+            translated_text = getattr(translation, "text", str(translation))
+            detected_source = getattr(
+                translation, "detected_source", getattr(translation, "src", None)
+            )
+            self._render_translation(request, translated_text, detected_source)
 
     def _render_translation(
         self,
