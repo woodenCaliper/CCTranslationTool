@@ -13,10 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import IO, Callable, Optional, Protocol
 
-try:  # pragma: no cover - executed during module import
-    import keyboard  # type: ignore
-except ImportError:  # pragma: no cover - handled in __init__
-    keyboard = None  # type: ignore
+from keyboard_adapter import create_keyboard_listener
 
 try:  # pragma: no cover - executed during module import
     import pyperclip  # type: ignore
@@ -206,6 +203,8 @@ class SingleInstanceGuard:
 class TranslationWindowManager:
     """Create and reuse a single Tk window for displaying translations."""
 
+    _UPDATE_INTERVAL_MS = 80
+
     def __init__(
         self,
         source_language: Optional[str],
@@ -218,8 +217,6 @@ class TranslationWindowManager:
         self._source_language = source_language
         self._dest_language = dest_language
         self._queue: "queue.Queue[tuple[str, str, Optional[str], bool]]" = queue.Queue()
-        self._ready = threading.Event()
-        self._thread: Optional[threading.Thread] = None
         self._language_toggle_callback = language_toggle_callback
         self._source_language_callback = source_language_callback
         self._dest_language_callback = dest_language_callback
@@ -227,6 +224,13 @@ class TranslationWindowManager:
         self._toggle_button: Optional[tk.Button] = None
         self._source_button: Optional[tk.Button] = None
         self._dest_button: Optional[tk.Button] = None
+        self._original_box: Optional[scrolledtext.ScrolledText] = None
+        self._translated_box: Optional[scrolledtext.ScrolledText] = None
+        self._process_job: Optional[str] = None
+        self._stop_job: Optional[str] = None
+        self._ui_thread_id: Optional[int] = None
+        self._language_update_pending = False
+        self._running = False
 
     def show(
         self,
@@ -236,103 +240,51 @@ class TranslationWindowManager:
         *,
         reposition: bool = True,
     ) -> None:
-        if self._thread is None or not self._thread.is_alive():
-            self._ready.clear()
-            self._thread = threading.Thread(target=self._run_window, daemon=True)
-            self._thread.start()
-            self._ready.wait()
         self._queue.put((original, translated, detected_source, reposition))
 
     def update_languages(self, source_language: Optional[str], dest_language: str) -> None:
         self._source_language = source_language
         self._dest_language = dest_language
-        if self._window is not None:
-            self._window.after(0, self._update_language_widgets)
+        if self._window is None:
+            return
+        if threading.get_ident() == self._ui_thread_id:
+            self._update_language_widgets()
+        else:
+            self._language_update_pending = True
 
-    def _update_language_widgets(self) -> None:
-        if self._source_button is not None:
-            self._source_button.configure(text=self._source_button_text())
-        if self._dest_button is not None:
-            self._dest_button.configure(text=self._dest_button_text())
+    def run(self, stop_event: threading.Event) -> None:
+        """Run the Tk main loop until ``stop_event`` becomes set."""
 
-    def _source_button_text(self) -> str:
-        display = _language_display(self._source_language or "auto")
-        return f"検出言語: {display}"
+        if stop_event.is_set():
+            return
+        if self._running:
+            raise RuntimeError("Translation window event loop is already running")
 
-    def _dest_button_text(self) -> str:
-        dest_label = _language_display(self._dest_language)
-        return f"翻訳先: {dest_label}"
-
-    def _toggle_button_style(self, button: tk.Button, font: tkfont.Font) -> None:
-        button.configure(
-            text="⇄",
-            font=font,
-            width=3,
-            bg="#1a73e8",
-            fg="white",
-            activebackground="#1765c1",
-            activeforeground="white",
-            relief=tk.FLAT,
-            bd=0,
-            highlightthickness=0,
-            cursor="hand2",
+        window = self._create_window()
+        self._ui_thread_id = threading.get_ident()
+        self._running = True
+        self._language_update_pending = True
+        self._process_job = window.after(0, self._process_queue)
+        self._stop_job = window.after(
+            self._UPDATE_INTERVAL_MS, lambda: self._poll_stop_event(stop_event)
         )
 
-    def _on_source_language_selected(self, selection: Optional[str]) -> None:
-        self._source_language = selection
-        if self._source_language_callback is not None:
-            self._source_language_callback(selection)
-        self._update_language_widgets()
+        if stop_event.is_set():
+            window.after(0, window.quit)
 
-    def _on_dest_language_selected(self, selection: str) -> None:
-        self._dest_language = selection
-        if self._dest_language_callback is not None:
-            self._dest_language_callback(selection)
-        self._update_language_widgets()
-
-    def _on_language_toggle(self) -> None:
-        if self._language_toggle_callback is not None:
-            self._language_toggle_callback()
-
-    def _open_source_menu(self, widget: tk.Widget) -> None:
-        if self._window is None:
-            return
-        menu = tk.Menu(self._window, tearoff=0)
-        options: tuple[Optional[str], ...] = (None, "ja", "en")
-        for code in options:
-            label = _language_display(code or "auto")
-            menu.add_command(
-                label=label,
-                command=lambda c=code: self._on_source_language_selected(c),
-            )
         try:
-            menu.tk_popup(
-                widget.winfo_rootx(),
-                widget.winfo_rooty() + widget.winfo_height(),
-            )
+            window.mainloop()
         finally:
-            menu.grab_release()
+            self._running = False
+            self._cancel_scheduled_jobs()
+            self._destroy_window()
+            self._ui_thread_id = None
+            self._language_update_pending = False
 
-    def _open_dest_menu(self, widget: tk.Widget) -> None:
-        if self._window is None:
-            return
-        menu = tk.Menu(self._window, tearoff=0)
-        options: tuple[str, ...] = ("ja", "en")
-        for code in options:
-            label = _language_display(code)
-            menu.add_command(
-                label=label,
-                command=lambda c=code: self._on_dest_language_selected(c),
-            )
-        try:
-            menu.tk_popup(
-                widget.winfo_rootx(),
-                widget.winfo_rooty() + widget.winfo_height(),
-            )
-        finally:
-            menu.grab_release()
+    def _create_window(self) -> tk.Tk:
+        if self._window is not None:
+            return self._window
 
-    def _run_window(self) -> None:
         window = tk.Tk()
         self._window = window
         window.title("CCTranslationTool")
@@ -349,9 +301,7 @@ class TranslationWindowManager:
             "Arial",
             default_font.actual("family"),
         )
-        available_families = {
-            name.lower(): name for name in tkfont.families()
-        }
+        available_families = {name.lower(): name for name in tkfont.families()}
 
         def resolve_family(preferences: tuple[str, ...]) -> str:
             for family in preferences:
@@ -417,6 +367,7 @@ class TranslationWindowManager:
         original_box = scrolledtext.ScrolledText(original_frame, wrap=tk.WORD, height=8)
         original_box.configure(state=tk.DISABLED, font=text_font)
         original_box.pack(fill=tk.BOTH, expand=True)
+        self._original_box = original_box
 
         translated_frame = tk.Frame(content_pane)
         content_pane.add(translated_frame, minsize=80)
@@ -427,174 +378,313 @@ class TranslationWindowManager:
         translated_box = scrolledtext.ScrolledText(translated_frame, wrap=tk.WORD, height=8)
         translated_box.configure(state=tk.DISABLED, font=text_font)
         translated_box.pack(fill=tk.BOTH, expand=True)
+        self._translated_box = translated_box
 
-        def hide_window() -> None:
-            window.withdraw()
+        window.protocol("WM_DELETE_WINDOW", self._hide_window)
+        window.bind("<Escape>", self._handle_escape)
 
-        def handle_escape(event: tk.Event) -> str:
-            """Hide the window when the Escape key is pressed."""
+        self._update_language_widgets()
 
-            hide_window()
-            return "break"
+        return window
 
-        window.protocol("WM_DELETE_WINDOW", hide_window)
-        window.bind("<Escape>", handle_escape)
+    def _hide_window(self) -> None:
+        if self._window is not None:
+            self._window.withdraw()
 
-        def _monitor_work_area(pointer_x: int, pointer_y: int) -> tuple[int, int, int, int] | None:
-            """Return work area bounds for the monitor nearest the pointer."""
+    def _handle_escape(self, event: tk.Event) -> str:
+        del event
+        self._hide_window()
+        return "break"
 
-            # Tk's multi-monitor support on Windows is limited to the primary display
-            # when querying ``winfo_screenwidth``/``winfo_screenheight``.  We fall back
-            # to the Windows API so the popup can be constrained to whichever monitor
-            # currently hosts the cursor.
-            import sys
+    def _cancel_scheduled_jobs(self) -> None:
+        window = self._window
+        if window is None:
+            return
+        if self._process_job is not None:
+            with contextlib.suppress(tk.TclError):
+                window.after_cancel(self._process_job)
+        if self._stop_job is not None:
+            with contextlib.suppress(tk.TclError):
+                window.after_cancel(self._stop_job)
+        self._process_job = None
+        self._stop_job = None
 
-            if sys.platform != "win32":
-                return None
-
-            try:
-                import ctypes
-                from ctypes import wintypes
-            except Exception:  # pragma: no cover - only executed on Windows
-                return None
-
-            MONITOR_DEFAULTTONEAREST = 2
-
-            user32 = ctypes.windll.user32  # type: ignore[attr-defined]
-
-            class MONITORINFO(ctypes.Structure):  # pragma: no cover - Windows only
-                _fields_ = [
-                    ("cbSize", wintypes.DWORD),
-                    ("rcMonitor", wintypes.RECT),
-                    ("rcWork", wintypes.RECT),
-                    ("dwFlags", wintypes.DWORD),
-                ]
-
-            monitor = user32.MonitorFromPoint(  # pragma: no cover - Windows only
-                wintypes.POINT(pointer_x, pointer_y),
-                MONITOR_DEFAULTTONEAREST,
-            )
-            if not monitor:
-                return None
-
-            info = MONITORINFO()
-            info.cbSize = ctypes.sizeof(MONITORINFO)
-            if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
-                return None
-
-            work = info.rcWork
-            return work.left, work.top, work.right, work.bottom
-
-        def place_near_pointer() -> None:
-            window.update_idletasks()
-            width = window.winfo_width() or window.winfo_reqwidth()
-            height = window.winfo_height() or window.winfo_reqheight()
-            pointer_x = window.winfo_pointerx()
-            pointer_y = window.winfo_pointery()
-
-            bounds = _monitor_work_area(pointer_x, pointer_y)
-            if bounds is None:
-                left, top = 0, 0
-                right = window.winfo_screenwidth()
-                bottom = window.winfo_screenheight()
-            else:
-                left, top, right, bottom = bounds
-
-            target_x = pointer_x - width // 2
-            target_y = pointer_y - height // 2
-
-            max_x = max(right - width, left)
-            max_y = max(bottom - height, top)
-            x = min(max(target_x, left), max_x)
-            y = min(max(target_y, top), max_y)
-            window.geometry(f"+{x}+{y}")
-
-        def _force_foreground() -> None:
-            """Ensure the Tk window becomes the active foreground window."""
-
-            import sys
-
-            if sys.platform != "win32":
-                return
-
-            try:  # pragma: no cover - Windows specific implementation
-                import ctypes
-                from ctypes import wintypes
-            except Exception:  # pragma: no cover - if ctypes is unavailable
-                return
-
-            user32 = ctypes.windll.user32  # type: ignore[attr-defined]
-            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-
-            hwnd = wintypes.HWND(window.winfo_id())
-            if not hwnd:
-                return
-
-            SW_SHOWNORMAL = 1
-
-            user32.ShowWindow(hwnd, SW_SHOWNORMAL)
-
-            user32.GetForegroundWindow.restype = wintypes.HWND
-            foreground_hwnd = user32.GetForegroundWindow()
-            if foreground_hwnd == hwnd:
-                return
-
-            user32.GetWindowThreadProcessId.restype = wintypes.DWORD
-            user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-
-            pid = wintypes.DWORD()
-            foreground_thread_id = user32.GetWindowThreadProcessId(
-                foreground_hwnd, ctypes.byref(pid)
-            )
-            current_thread_id = kernel32.GetCurrentThreadId()
-
-            attached = False
-            if foreground_thread_id and foreground_thread_id != current_thread_id:
-                attached = bool(
-                    user32.AttachThreadInput(foreground_thread_id, current_thread_id, True)
-                )
-
-            try:
-                user32.BringWindowToTop(hwnd)
-                user32.SetForegroundWindow(hwnd)
-            finally:
-                if attached:
-                    user32.AttachThreadInput(foreground_thread_id, current_thread_id, False)
-
-        def bring_to_front(reposition: bool) -> None:
-            if reposition:
-                place_near_pointer()
-            window.deiconify()
-            window.lift()
-            _force_foreground()
-            window.attributes("-topmost", True)
-            window.after(100, lambda: window.attributes("-topmost", False))
-            window.focus_force()
-
-        def apply_update() -> None:
-            try:
-                while True:
-                    original, translated, detected_source, reposition = self._queue.get_nowait()
-                    original_box.configure(state=tk.NORMAL)
-                    original_box.delete("1.0", tk.END)
-                    original_box.insert(tk.END, original)
-                    original_box.configure(state=tk.DISABLED)
-                    translated_box.configure(state=tk.NORMAL)
-                    translated_box.delete("1.0", tk.END)
-                    translated_box.insert(tk.END, translated)
-                    translated_box.configure(state=tk.DISABLED)
-                    bring_to_front(reposition)
-            except queue.Empty:
-                pass
-            window.after(100, apply_update)
-
-        self._ready.set()
-        apply_update()
-        window.mainloop()
+    def _destroy_window(self) -> None:
+        window = self._window
+        if window is None:
+            return
         self._window = None
         self._toggle_button = None
         self._source_button = None
         self._dest_button = None
+        self._original_box = None
+        self._translated_box = None
+        with contextlib.suppress(tk.TclError):
+            window.destroy()
+
+    def _update_language_widgets(self) -> None:
+        if self._source_button is not None:
+            self._source_button.configure(text=self._source_button_text())
+        if self._dest_button is not None:
+            self._dest_button.configure(text=self._dest_button_text())
+
+    def _source_button_text(self) -> str:
+        display = _language_display(self._source_language or "auto")
+        return f"検出言語: {display}"
+
+    def _dest_button_text(self) -> str:
+        dest_label = _language_display(self._dest_language)
+        return f"翻訳先: {dest_label}"
+
+    def _toggle_button_style(self, button: tk.Button, font: tkfont.Font) -> None:
+        button.configure(
+            text="⇄",
+            font=font,
+            width=3,
+            bg="#1a73e8",
+            fg="white",
+            activebackground="#1765c1",
+            activeforeground="white",
+            relief=tk.FLAT,
+            bd=0,
+            highlightthickness=0,
+            cursor="hand2",
+        )
+
+    def _on_source_language_selected(self, selection: Optional[str]) -> None:
+        self._source_language = selection
+        if self._source_language_callback is not None:
+            self._source_language_callback(selection)
+        if threading.get_ident() == self._ui_thread_id:
+            self._update_language_widgets()
+        else:
+            self._language_update_pending = True
+
+    def _on_dest_language_selected(self, selection: str) -> None:
+        self._dest_language = selection
+        if self._dest_language_callback is not None:
+            self._dest_language_callback(selection)
+        if threading.get_ident() == self._ui_thread_id:
+            self._update_language_widgets()
+        else:
+            self._language_update_pending = True
+
+    def _on_language_toggle(self) -> None:
+        if self._language_toggle_callback is not None:
+            self._language_toggle_callback()
+
+    def _open_source_menu(self, widget: tk.Widget) -> None:
+        if self._window is None:
+            return
+        menu = tk.Menu(self._window, tearoff=0)
+        options: tuple[Optional[str], ...] = (None, "ja", "en")
+        for code in options:
+            label = _language_display(code or "auto")
+            menu.add_command(
+                label=label,
+                command=lambda c=code: self._on_source_language_selected(c),
+            )
+        try:
+            menu.tk_popup(
+                widget.winfo_rootx(),
+                widget.winfo_rooty() + widget.winfo_height(),
+            )
+        finally:
+            menu.grab_release()
+
+    def _open_dest_menu(self, widget: tk.Widget) -> None:
+        if self._window is None:
+            return
+        menu = tk.Menu(self._window, tearoff=0)
+        options: tuple[str, ...] = ("ja", "en")
+        for code in options:
+            label = _language_display(code)
+            menu.add_command(
+                label=label,
+                command=lambda c=code: self._on_dest_language_selected(c),
+            )
+        try:
+            menu.tk_popup(
+                widget.winfo_rootx(),
+                widget.winfo_rooty() + widget.winfo_height(),
+            )
+        finally:
+            menu.grab_release()
+
+    def _monitor_work_area(self, pointer_x: int, pointer_y: int) -> tuple[int, int, int, int] | None:
+        import sys
+
+        if sys.platform != "win32":
+            return None
+
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except Exception:  # pragma: no cover - only executed on Windows
+            return None
+
+        MONITOR_DEFAULTTONEAREST = 2
+
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+
+        class MONITORINFO(ctypes.Structure):  # pragma: no cover - Windows only
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        monitor = user32.MonitorFromPoint(  # pragma: no cover - Windows only
+            wintypes.POINT(pointer_x, pointer_y),
+            MONITOR_DEFAULTTONEAREST,
+        )
+        if not monitor:
+            return None
+
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(MONITORINFO)
+        if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            return None
+
+        work = info.rcWork
+        return work.left, work.top, work.right, work.bottom
+
+    def _place_near_pointer(self) -> None:
+        window = self._window
+        if window is None:
+            return
+        window.update_idletasks()
+        width = window.winfo_width() or window.winfo_reqwidth()
+        height = window.winfo_height() or window.winfo_reqheight()
+        pointer_x = window.winfo_pointerx()
+        pointer_y = window.winfo_pointery()
+
+        bounds = self._monitor_work_area(pointer_x, pointer_y)
+        if bounds is None:
+            left, top = 0, 0
+            right = window.winfo_screenwidth()
+            bottom = window.winfo_screenheight()
+        else:
+            left, top, right, bottom = bounds
+
+        target_x = pointer_x - width // 2
+        target_y = pointer_y - height // 2
+
+        max_x = max(right - width, left)
+        max_y = max(bottom - height, top)
+        x = min(max(target_x, left), max_x)
+        y = min(max(target_y, top), max_y)
+        window.geometry(f"+{x}+{y}")
+
+    def _force_foreground(self) -> None:
+        window = self._window
+        if window is None:
+            return
+
+        import sys
+
+        if sys.platform != "win32":
+            return
+
+        try:  # pragma: no cover - Windows specific implementation
+            import ctypes
+            from ctypes import wintypes
+        except Exception:  # pragma: no cover - if ctypes is unavailable
+            return
+
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+
+        hwnd = wintypes.HWND(window.winfo_id())
+        if not hwnd:
+            return
+
+        SW_SHOWNORMAL = 1
+
+        user32.ShowWindow(hwnd, SW_SHOWNORMAL)
+
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        foreground_hwnd = user32.GetForegroundWindow()
+        if foreground_hwnd == hwnd:
+            return
+
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+
+        pid = wintypes.DWORD()
+        foreground_thread_id = user32.GetWindowThreadProcessId(
+            foreground_hwnd, ctypes.byref(pid)
+        )
+        current_thread_id = kernel32.GetCurrentThreadId()
+
+        attached = False
+        if foreground_thread_id and foreground_thread_id != current_thread_id:
+            attached = bool(
+                user32.AttachThreadInput(foreground_thread_id, current_thread_id, True)
+            )
+
+        try:
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+        finally:
+            if attached:
+                user32.AttachThreadInput(foreground_thread_id, current_thread_id, False)
+
+    def _bring_to_front(self, reposition: bool) -> None:
+        window = self._window
+        if window is None:
+            return
+        if reposition:
+            self._place_near_pointer()
+        window.deiconify()
+        window.lift()
+        self._force_foreground()
+        window.attributes("-topmost", True)
+        window.after(100, lambda: window.attributes("-topmost", False))
+        window.focus_force()
+
+    def _process_queue(self) -> None:
+        window = self._window
+        if window is None:
+            return
+        try:
+            while True:
+                original, translated, _detected_source, reposition = self._queue.get_nowait()
+                if self._original_box is not None:
+                    self._original_box.configure(state=tk.NORMAL)
+                    self._original_box.delete("1.0", tk.END)
+                    self._original_box.insert(tk.END, original)
+                    self._original_box.configure(state=tk.DISABLED)
+                if self._translated_box is not None:
+                    self._translated_box.configure(state=tk.NORMAL)
+                    self._translated_box.delete("1.0", tk.END)
+                    self._translated_box.insert(tk.END, translated)
+                    self._translated_box.configure(state=tk.DISABLED)
+                self._bring_to_front(reposition)
+        except queue.Empty:
+            pass
+
+        if self._language_update_pending:
+            self._language_update_pending = False
+            self._update_language_widgets()
+
+        if self._running and self._window is not None:
+            self._process_job = self._window.after(
+                self._UPDATE_INTERVAL_MS, self._process_queue
+            )
+
+    def _poll_stop_event(self, stop_event: threading.Event) -> None:
+        window = self._window
+        if window is None:
+            return
+        if stop_event.is_set():
+            self._hide_window()
+            window.quit()
+            return
+        self._stop_job = window.after(
+            self._UPDATE_INTERVAL_MS, lambda: self._poll_stop_event(stop_event)
+        )
 
 
 class SystemTrayController:
@@ -676,7 +766,7 @@ class CCTranslationApp:
         source_language: Optional[str] = None,
         *,
         translator_factory: Callable[[], TranslatorProtocol] = GoogleTranslateClient,
-        keyboard_module=keyboard,
+        keyboard_module=None,
         clipboard_module=pyperclip,
         time_provider: Callable[[], float] = time.time,
         display_callback: Optional[Callable[[str, str, Optional[str]], None]] = None,
@@ -694,8 +784,10 @@ class CCTranslationApp:
         self._restart_event = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
         if keyboard_module is None:
+            keyboard_module = create_keyboard_listener()
+        if keyboard_module is None:
             raise RuntimeError(
-                "The 'keyboard' package is required. Install it with 'pip install keyboard'."
+                "The 'pyWinhook' package is required. Install it with 'pip install pyWinhook'."
             )
         if clipboard_module is None:
             raise RuntimeError(
@@ -747,7 +839,10 @@ class CCTranslationApp:
                 self._tray_controller.start()
 
             try:
-                self._stop_event.wait()
+                if self._display_callback is None:
+                    self._window_manager.run(self._stop_event)
+                else:
+                    self._stop_event.wait()
             except KeyboardInterrupt:  # pragma: no cover - manual console interruption
                 self.stop()
             finally:
