@@ -62,6 +62,7 @@ LANGUAGE_DISPLAY_NAMES = {
 
 _TIMING_ENV_VAR = "CCTRANSLATION_TIMING_LOGS"
 _TIMING_WARNING_THRESHOLD = 0.5
+_IO_TIMING_WARNING_THRESHOLD = 1.0
 _TIMING_LOGS_ENABLED = os.environ.get(_TIMING_ENV_VAR, "").lower() in {
     "1",
     "true",
@@ -91,14 +92,48 @@ def _timing_log(
 ) -> None:
     if not _timing_enabled():
         return
-    prefix = "[TIMING WARN]" if warn else "[TIMING]"
-    time_str = time.strftime("%H:%M:%S", time.localtime(timestamp))
-    parts = [prefix, time_str, label, event]
+    prefix = "TIMING_WARN" if warn else "TIMING"
+    time_str = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(timestamp))
+    parts = [prefix, label, event, time_str]
     if duration is not None:
-        parts.append(f"Δ{duration:.3f}s")
+        parts.append(f"{duration:.6f}")
+    else:
+        parts.append("")
     if extra:
-        parts.append(extra)
-    print(" ".join(parts))
+        sanitized = extra.replace("\n", " ").replace(",", ";")
+        parts.append(sanitized)
+    else:
+        parts.append("")
+    print(",".join(parts))
+
+
+def _io_timing_log(
+    kind: str,
+    label: str,
+    start_wall: float,
+    end_wall: float,
+    duration: float,
+    *,
+    status: str,
+    warn: bool,
+    extra: str = "",
+) -> None:
+    if not _timing_enabled():
+        return
+    start_str = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(start_wall))
+    end_str = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(end_wall))
+    sanitized_extra = extra.replace("\n", " ").replace(",", ";") if extra else ""
+    row = [
+        "IO_TIMING_WARN" if warn else "IO_TIMING",
+        kind,
+        label,
+        start_str,
+        end_str,
+        f"{duration:.6f}",
+        status,
+        sanitized_extra,
+    ]
+    print(",".join(row))
 
 
 @contextlib.contextmanager
@@ -165,6 +200,43 @@ def _timed_lock(lock: threading.Lock, label: str):
         )
 
 
+@contextlib.contextmanager
+def _timed_io(label: str, kind: str):
+    if not _timing_enabled():
+        yield
+        return
+    start_wall = time.time()
+    start_perf = time.perf_counter()
+    try:
+        yield
+    except Exception as exc:
+        end_wall = time.time()
+        duration = time.perf_counter() - start_perf
+        _io_timing_log(
+            kind,
+            label,
+            start_wall,
+            end_wall,
+            duration,
+            status=exc.__class__.__name__,
+            warn=duration > _IO_TIMING_WARNING_THRESHOLD,
+            extra=str(exc),
+        )
+        raise
+    else:
+        end_wall = time.time()
+        duration = time.perf_counter() - start_perf
+        _io_timing_log(
+            kind,
+            label,
+            start_wall,
+            end_wall,
+            duration,
+            status="ok",
+            warn=duration > _IO_TIMING_WARNING_THRESHOLD,
+        )
+
+
 class _RenderCounter:
     """Count render-like events within a sliding time window when enabled."""
 
@@ -212,7 +284,7 @@ if _RENDER_DIAGNOSTICS_ENABLED:
 def _load_saved_dest_language(default: str = "ja") -> str:
     with _timed_scope("_load_saved_dest_language"):
         try:
-            with _timed_scope("_load_saved_dest_language.read_text"):
+            with _timed_io("_load_saved_dest_language.read_text", "file"):
                 raw = PREFERENCES_FILE.read_text(encoding="utf-8")
             with _timed_scope("_load_saved_dest_language.json_loads"):
                 data = json.loads(raw)
@@ -225,9 +297,9 @@ def _load_saved_dest_language(default: str = "ja") -> str:
 def _save_dest_language(dest: str) -> None:
     with _timed_scope("_save_dest_language"):
         try:
-            with _timed_scope("_save_dest_language.mkdir"):
+            with _timed_io("_save_dest_language.mkdir", "file"):
                 PREFERENCES_FILE.parent.mkdir(parents=True, exist_ok=True)
-            with _timed_scope("_save_dest_language.write_text"):
+            with _timed_io("_save_dest_language.write_text", "file"):
                 PREFERENCES_FILE.write_text(
                     json.dumps({"dest_language": dest}), encoding="utf-8"
                 )
@@ -309,18 +381,22 @@ class SingleInstanceGuard:
     def acquire(self) -> None:
         if self._lock_file is not None:
             return
-        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock_file = open(self._lock_path, "a+")
+        with _timed_io("SingleInstanceGuard.acquire.mkdir", "file"):
+            self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with _timed_io("SingleInstanceGuard.acquire.open", "file"):
+            self._lock_file = open(self._lock_path, "a+")
         try:
             if sys.platform == "win32":  # pragma: no cover - platform specific
                 import msvcrt  # type: ignore
 
                 self._lock_file.seek(0)
-                msvcrt.locking(self._lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                with _timed_io("SingleInstanceGuard.acquire.msvcrt_lock", "file"):
+                    msvcrt.locking(self._lock_file.fileno(), msvcrt.LK_NBLCK, 1)
             else:  # pragma: no cover - exercised on non-Windows platforms
                 import fcntl  # type: ignore
 
-                fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with _timed_io("SingleInstanceGuard.acquire.fcntl_lock", "file"):
+                    fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             self.release()
             raise SingleInstanceError("Another instance is already running") from exc
@@ -334,23 +410,27 @@ class SingleInstanceGuard:
 
                 self._lock_file.seek(0)
                 try:
-                    msvcrt.locking(self._lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                    with _timed_io("SingleInstanceGuard.release.msvcrt_unlock", "file"):
+                        msvcrt.locking(self._lock_file.fileno(), msvcrt.LK_UNLCK, 1)
                 except OSError:
                     pass
             else:  # pragma: no cover - exercised on non-Windows platforms
                 import fcntl  # type: ignore
 
                 try:
-                    fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
+                    with _timed_io("SingleInstanceGuard.release.fcntl_unlock", "file"):
+                        fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
                 except OSError:
                     pass
         finally:
             try:
-                self._lock_file.close()
+                with _timed_io("SingleInstanceGuard.release.close", "file"):
+                    self._lock_file.close()
             finally:
                 self._lock_file = None
                 with contextlib.suppress(OSError):
-                    self._lock_path.unlink()
+                    with _timed_io("SingleInstanceGuard.release.unlink", "file"):
+                        self._lock_path.unlink()
 
     def __enter__(self) -> "SingleInstanceGuard":
         self.acquire()
@@ -903,8 +983,9 @@ class SystemTrayController:
         icon_path = _resource_path("icon/CCT_icon.png")
         if icon_path.exists():
             try:
-                with Image.open(icon_path) as icon:
-                    return icon.convert("RGBA")
+                with _timed_io("SystemTrayController._create_icon_image.Image.open", "file"):
+                    with Image.open(icon_path) as icon:
+                        return icon.convert("RGBA")
             except Exception:
                 pass
 
@@ -1114,9 +1195,10 @@ class CCTranslationApp:
                 self._last_original_text = request.text
             try:
                 with _timed_scope("CCTranslationApp._process_single_request.translate"):
-                    translation = self.translator.translate(
-                        request.text, src=request.src, dest=request.dest
-                    )
+                    with _timed_io("GoogleTranslateClient.translate", "http"):
+                        translation = self.translator.translate(
+                            request.text, src=request.src, dest=request.dest
+                        )
             except TranslationError as exc:  # pragma: no cover - network errors are runtime issues
                 self._render_translation(
                     request,
