@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import contextlib
 import json
 import os
@@ -67,6 +68,12 @@ _TIMING_LOGS_ENABLED = os.environ.get(_TIMING_ENV_VAR, "").lower() in {
     "yes",
     "on",
 }
+
+_RENDER_DIAGNOSTICS_ENV_VAR = "CCTRANSLATION_RENDER_DIAGNOSTICS"
+_RENDER_DIAGNOSTICS_WINDOW = 10.0
+_RENDER_DIAGNOSTICS_ENABLED = os.environ.get(
+    _RENDER_DIAGNOSTICS_ENV_VAR, ""
+).lower() in {"1", "true", "yes", "on"}
 
 
 def _timing_enabled() -> bool:
@@ -156,6 +163,50 @@ def _timed_lock(lock: threading.Lock, label: str):
             warn=hold_duration > _TIMING_WARNING_THRESHOLD,
             extra=f"(total Δ{total_duration:.3f}s)",
         )
+
+
+class _RenderCounter:
+    """Count render-like events within a sliding time window when enabled."""
+
+    def __init__(self, window_seconds: float) -> None:
+        self._window = window_seconds
+        self._lock = threading.Lock()
+        self._enabled = _RENDER_DIAGNOSTICS_ENABLED
+        self._window_start = time.perf_counter()
+        self._counts: dict[str, int] = {}
+
+    def record(self, label: str) -> None:
+        if not self._enabled:
+            return
+        now = time.perf_counter()
+        with self._lock:
+            if now - self._window_start >= self._window:
+                self._flush(now)
+            self._counts[label] = self._counts.get(label, 0) + 1
+
+    def _flush(self, now: float) -> None:
+        if not self._counts:
+            self._window_start = now
+            return
+        timestamp = time.strftime("%H:%M:%S", time.localtime())
+        total = sum(self._counts.values())
+        breakdown = ", ".join(f"{label}={count}" for label, count in self._counts.items())
+        print(
+            f"[RENDER] {timestamp} window={self._window:.0f}s total={total} ({breakdown})"
+        )
+        self._counts.clear()
+        self._window_start = now
+
+    def finalize(self) -> None:
+        if not self._enabled:
+            return
+        with self._lock:
+            self._flush(time.perf_counter())
+
+
+_render_counter = _RenderCounter(_RENDER_DIAGNOSTICS_WINDOW)
+if _RENDER_DIAGNOSTICS_ENABLED:
+    atexit.register(_render_counter.finalize)
 
 
 def _load_saved_dest_language(default: str = "ja") -> str:
@@ -1086,6 +1137,7 @@ class CCTranslationApp:
         translated: str,
         detected_source: Optional[str],
     ) -> None:
+        _render_counter.record("translation_render")
         if self._display_callback is not None:
             self._display_callback(request.text, translated, detected_source)
         else:
