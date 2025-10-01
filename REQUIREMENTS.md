@@ -8,12 +8,14 @@
 ## 対象プラットフォームと依存関係
 - 推奨 OS: Windows 10 以降。Python 3.9 以上が必要。【F:README.md†L22-L35】
 - クリップボード操作 (pyperclip) とグローバルホットキー取得 (pyWinhook) を使用。Tkinter による GUI 表示に対応している環境が前提。【F:translator_app.py†L8-L117】【F:README.md†L22-L49】
+- グローバルキーボードフックは pyWinhook で実装し、Windows API レベルで `Ctrl + C` 押下イベントを取得できることを必須要件とする。【F:keyboard_adapter.py†L1-L160】【F:translator_app.py†L108-L209】
 - 任意機能として pystray と Pillow によるシステムトレイアイコン表示に対応。依存関係が不足する場合は自動的に機能を無効化する。【F:translator_app.py†L30-L209】【F:translator_app.py†L459-L542】
 
 ## 機能要件
 ### ホットキー監視とコピー検出
 1. `Ctrl + C` が短時間 (既定 0.5 秒以内) に 2 回押されたときのみ翻訳要求を生成する。間隔は設定可能とし、ダブルコピー検出ユーティリティで管理する。【F:translator_app.py†L54-L166】【F:translator_app.py†L543-L655】
-2. クリップボードから取得したテキストが空の場合や前回と同一の場合は翻訳をスキップする。【F:translator_app.py†L656-L792】
+2. グローバルホットキーの検知は pyWinhook を介して行い、Windows のメッセージループを用いて安定的にキーダウン・キーアップイベントを監視する。【F:keyboard_adapter.py†L1-L160】【F:translator_app.py†L108-L209】
+3. クリップボードから取得したテキストが空の場合や前回と同一の場合は翻訳をスキップする。【F:translator_app.py†L656-L792】
 
 ### 翻訳処理
 1. Google 翻訳クライアントを用いてテキストを翻訳し、翻訳元言語を自動検出する。`--src` が指定された場合はその言語を優先する。【F:translation_service.py†L1-L154】【F:translator_app.py†L70-L166】
