@@ -165,6 +165,18 @@ class CCTranslationAppTests(CCTranslationAppTestMixin, unittest.TestCase):
         self.assertEqual(request.dest, "en")
         self.assertFalse(request.reposition)
 
+    def test_waiting_queue_keeps_only_latest_request(self):
+        app = self._create_app()
+
+        app._enqueue_request(TranslationRequest(text="first", src=None, dest="ja"))
+        app._enqueue_request(TranslationRequest(text="second", src="en", dest="ja", reposition=False))
+
+        request = app._request_queue.get_nowait()
+        self.assertEqual(request.text, "second")
+        self.assertEqual(request.src, "en")
+        self.assertFalse(request.reposition)
+        self.assertTrue(app._request_queue.empty())
+
     def test_process_single_request_uses_translator(self):
         translator = FakeTranslator(translated="translated", detected="en")
         captured = []
