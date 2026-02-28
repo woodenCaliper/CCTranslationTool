@@ -689,7 +689,7 @@ class CCTranslationApp:
         self._translator_lock = threading.Lock()
         self._copy_detector = DoubleCopyDetector(double_copy_interval, time_provider)
         self._lock = threading.Lock()
-        self._request_queue: "queue.Queue[TranslationRequest]" = queue.Queue()
+        self._request_queue: "queue.Queue[TranslationRequest]" = queue.Queue(maxsize=1)
         self._stop_event = threading.Event()
         self._restart_event = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
@@ -829,9 +829,20 @@ class CCTranslationApp:
                     return
                 text = text.strip()
                 if text:
-                    self._request_queue.put(
+                    self._enqueue_request(
                         TranslationRequest(text=text, src=self.source_language, dest=self.dest_language)
                     )
+
+    def _enqueue_request(self, request: TranslationRequest) -> None:
+        """Keep only one waiting request so stale work does not accumulate."""
+
+        try:
+            while True:
+                self._request_queue.get_nowait()
+                self._request_queue.task_done()
+        except queue.Empty:
+            pass
+        self._request_queue.put_nowait(request)
 
     def _process_requests(self) -> None:
         while True:
@@ -889,7 +900,7 @@ class CCTranslationApp:
     ) -> None:
         if not text or not dest:
             return
-        self._request_queue.put(
+        self._enqueue_request(
             TranslationRequest(text=text, src=src, dest=dest, reposition=False)
         )
 
